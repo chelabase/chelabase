@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use chelabase_metadata::{
     CopyUpsert, DataKeyRecord, KeyRoleFix, ObservedDatabase, ResyncApplied, ResyncWrite,
-    RoleAttributes, RoleCopy, RoleLevel, RoleOrigin, SealedChange,
+    RoleAttributes, RoleCopy, RoleField, RoleLevel, RoleOrigin, SealedChange,
 };
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::seal_role_password;
@@ -722,6 +722,37 @@ fn retried_reset(row: &RoleCopy) -> bool {
         && row.password_enc.is_some()
 }
 
+/// What an `api` row's pending change wants (#425), against the catalog's `o`: the fields
+/// the change named (`attributes_named`) from the row, every other one from `o`, so a change
+/// made in SQL since is kept. `(owner_level, login, attributes)`; owner level is the row's
+/// wanted one or the catalog's owner attributes, memberships (with their options) the row's
+/// or the catalog's.
+pub(crate) fn pending_wanted(row: &RoleCopy, o: &ObservedRole) -> (bool, bool, RoleAttributes) {
+    let named = |f: RoleField| row.attributes_named.contains(&f);
+    let (r, c) = (&row.attributes, o.attributes());
+    let members = named(RoleField::MemberOf);
+    let attributes = RoleAttributes {
+        inherit: if named(RoleField::Inherit) { r.inherit } else { c.inherit },
+        connection_limit: if named(RoleField::ConnectionLimit) {
+            r.connection_limit
+        } else {
+            c.connection_limit
+        },
+        valid_until: if named(RoleField::ValidUntil) { r.valid_until } else { c.valid_until },
+        bypass_rls: if named(RoleField::BypassRls) { r.bypass_rls } else { c.bypass_rls },
+        member_of: if members { r.member_of.clone() } else { c.member_of },
+        member_no_set: if members { r.member_no_set.clone() } else { c.member_no_set },
+        member_admin: if members { r.member_admin.clone() } else { c.member_admin },
+    };
+    let owner_level = if named(RoleField::OwnerLevel) {
+        row.api_owner_level
+    } else {
+        o.owner_attributes
+    };
+    let login = if named(RoleField::Login) { row.login } else { o.login };
+    (owner_level, login, attributes)
+}
+
 /// One role's SQL statements, run as one script of their own (C1): a failure stops only
 /// that role's group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,10 +869,27 @@ pub fn plan_resync(
                     push_repair(&mut repairs, &row.name, password_sql(&row.name, stored));
                 }
                 let recorded = if row.attributes_pending {
+                    // #425: only what the change named is driven; the rest is the catalog's.
+                    let (owner_level, login, mut attributes) = pending_wanted(row, o);
+                    if row.attributes_named.contains(&RoleField::MemberOf) {
+                        attributes.member_of = wanted_attributes.member_of.clone();
+                        attributes.member_no_set = wanted_attributes.member_no_set.clone();
+                        attributes.member_admin = wanted_attributes.member_admin.clone();
+                    }
+                    let wanted = WantedRole {
+                        name: &row.name,
+                        owner_level,
+                        login,
+                        attributes: &attributes,
+                    };
                     for sql in wanted_statements(owner, &wanted, o) {
                         push_repair(&mut repairs, &row.name, sql);
                     }
-                    (row.login, level(row.api_owner_level), None, wanted_attributes.clone())
+                    if row.attributes_named.contains(&RoleField::OwnerLevel) {
+                        (login, level(owner_level), None, attributes)
+                    } else {
+                        (login, level(o.owner_level), Some(o.owner_attributes), attributes)
+                    }
                 } else {
                     (
                         o.login,
@@ -1604,6 +1652,7 @@ mod tests {
             api_owner_level: false,
             pending: false,
             attributes_pending: false,
+            attributes_named: chelabase_metadata::RoleField::all(),
             created_at: Timestamp::UNIX_EPOCH,
             attributes: RoleAttributes::default(),
         }
@@ -2773,6 +2822,168 @@ mod tests {
         assert_eq!(checked, 16 * 2 * 2 * 2 * 2 * 6);
     }
 
+    // #425 invariant: a pending API change drives onto the compute only the fields it named.
+    // A named field is driven (when the catalog differs) and recorded from the row; an
+    // unnamed one gets no statement and is recorded from the catalog. Driving the result
+    // again changes nothing. Exhaustive over every subset of the fields × owner level turned
+    // on or off; every field differs between the row and the catalog.
+    #[test]
+    fn a_pending_change_drives_only_the_fields_it_named_exhaustively() {
+        use chelabase_metadata::RoleField;
+        let mut checked = 0;
+        for subset in 0..(1_u32 << RoleField::ALL.len()) {
+            let named: BTreeSet<RoleField> = RoleField::ALL
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| subset & (1 << i) != 0)
+                .map(|(_, f)| f)
+                .collect();
+            let has = |f: RoleField| named.contains(&f);
+            for seen_owner in [false, true] {
+                let mut row = copy("r", RoleOrigin::Api, None);
+                row.login = false;
+                row.password_enc = None;
+                row.api_owner_level = !seen_owner;
+                row.level = level_of(!seen_owner);
+                row.pending = true;
+                row.attributes_pending = true;
+                row.attributes_named = named.clone();
+                row.attributes = RoleAttributes {
+                    inherit: false,
+                    connection_limit: 3,
+                    // A recorded "no expiry" against a later SQL `-infinity` (the audit's case).
+                    valid_until: None,
+                    // Plain: BYPASSRLS on its own, which the catalog hasn't; owner level
+                    // taken away: without it.
+                    bypass_rls: !seen_owner,
+                    member_of: vec!["g".into()],
+                    member_no_set: vec![],
+                    member_admin: vec![],
+                };
+                let mut o = role("r", None);
+                o.login = true;
+                o.owner_attributes = seen_owner;
+                o.owner_level = seen_owner;
+                o.bypass_rls = seen_owner;
+                o.valid_until = Some(Timestamp::PG_ROUND_TRIP_MIN);
+                o.member_of = vec!["h".into()];
+                o.owner_granted = vec!["h".into()];
+                let roles = |r: ObservedRole| observed(vec![r, role("g", None), role("h", None)]);
+                let (repairs, write) =
+                    plan_resync(OWNER_ROLE, std::slice::from_ref(&row), &roles(o.clone()));
+                let statements = flat(&repairs);
+                let case = format!("named={named:?} seen_owner={seen_owner}: {statements:?}");
+                let tokens: Vec<String> = statements
+                    .iter()
+                    .flat_map(|s| s.split(|c: char| c.is_whitespace() || c == ';'))
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                let mentions = |words: &[&str]| tokens.iter().any(|t| words.contains(&t.as_str()));
+                assert_eq!(mentions(&["LOGIN", "NOLOGIN"]), has(RoleField::Login), "{case}");
+                assert_eq!(mentions(&["INHERIT", "NOINHERIT"]), has(RoleField::Inherit), "{case}");
+                assert_eq!(mentions(&["CONNECTION"]), has(RoleField::ConnectionLimit), "{case}");
+                assert_eq!(mentions(&["UNTIL"]), has(RoleField::ValidUntil), "{case}");
+                assert_eq!(mentions(&["\"g\"", "\"h\""]), has(RoleField::MemberOf), "{case}");
+                assert_eq!(
+                    mentions(&["neon_superuser", "CREATEROLE", "NOCREATEROLE"]),
+                    has(RoleField::OwnerLevel),
+                    "{case}"
+                );
+                if !seen_owner && !has(RoleField::OwnerLevel) {
+                    assert_eq!(
+                        mentions(&["BYPASSRLS", "NOBYPASSRLS"]),
+                        has(RoleField::BypassRls),
+                        "{case}"
+                    );
+                }
+
+                // Recorded: the named fields from the row, the rest from the catalog.
+                let pick = |f: RoleField| has(f);
+                let wanted_owner = if pick(RoleField::OwnerLevel) { row.api_owner_level } else { seen_owner };
+                let expected = RoleAttributes {
+                    inherit: if pick(RoleField::Inherit) { row.attributes.inherit } else { o.inherit },
+                    connection_limit: if pick(RoleField::ConnectionLimit) {
+                        row.attributes.connection_limit
+                    } else {
+                        o.connection_limit
+                    },
+                    valid_until: if pick(RoleField::ValidUntil) { row.attributes.valid_until } else { o.valid_until },
+                    bypass_rls: if pick(RoleField::BypassRls) { row.attributes.bypass_rls } else { o.bypass_rls },
+                    member_of: if pick(RoleField::MemberOf) { row.attributes.member_of.clone() } else { o.member_of.clone() },
+                    member_no_set: vec![],
+                    member_admin: vec![],
+                };
+                let login = if pick(RoleField::Login) { row.login } else { o.login };
+                let u = upsert(&write, "r").expect("written");
+                assert_eq!(u.attributes, expected, "{case}");
+                assert_eq!(u.login, login, "{case}");
+                assert_eq!(u.level, level_of(wanted_owner), "{case}");
+                let api_owner_level = (!pick(RoleField::OwnerLevel)).then_some(seen_owner);
+                assert_eq!(u.api_owner_level, api_owner_level, "{case}");
+                assert!(!u.pending, "{case}");
+
+                // Driving it again against the catalog it made changes nothing.
+                let mut done = o.clone();
+                done.login = login;
+                done.inherit = expected.inherit;
+                done.connection_limit = expected.connection_limit;
+                done.valid_until = expected.valid_until;
+                done.owner_attributes = wanted_owner;
+                done.owner_level = wanted_owner;
+                done.bypass_rls = wanted_owner || expected.bypass_rls;
+                done.member_of = expected.member_of.clone();
+                done.owner_granted = expected.member_of.clone();
+                let (again, _) = plan_resync(OWNER_ROLE, std::slice::from_ref(&row), &roles(done));
+                assert!(again.is_empty(), "converges: {case} then {again:?}");
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 128 * 2);
+    }
+
+    fn level_of(owner_level: bool) -> RoleLevel {
+        if owner_level { RoleLevel::OwnerLevel } else { RoleLevel::Plain }
+    }
+
+    // #425, the audit's case: a pending PATCH that changed only the connection limit, over a
+    // role expired in SQL since (`VALID UNTIL '-infinity'`), sets the limit and records the
+    // SQL expiry; one that named the expiry ("no expiry") drives it. Without a pending change
+    // the resync only records (as before).
+    #[test]
+    fn a_pending_change_leaves_an_expiry_set_in_sql_since() {
+        use chelabase_metadata::RoleField;
+        let pending = |named: &[RoleField]| {
+            let mut row = copy("r", RoleOrigin::Api, Some(SCRAM_A));
+            row.attributes.connection_limit = 3;
+            row.pending = true;
+            row.attributes_pending = true;
+            row.attributes_named = named.iter().copied().collect();
+            row
+        };
+        let mut o = role("r", Some(SCRAM_A));
+        o.valid_until = Some(Timestamp::PG_ROUND_TRIP_MIN);
+        let seen = observed(vec![o.clone()]);
+
+        let (repairs, write) = plan_resync(OWNER_ROLE, &[pending(&[RoleField::ConnectionLimit])], &seen);
+        assert_eq!(flat(&repairs), ["ALTER ROLE \"r\" CONNECTION LIMIT 3;"]);
+        let u = upsert(&write, "r").unwrap();
+        assert_eq!(u.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "the SQL expiry");
+        assert_eq!(u.attributes.connection_limit, 3);
+
+        let both = [RoleField::ConnectionLimit, RoleField::ValidUntil];
+        let (repairs, write) = plan_resync(OWNER_ROLE, &[pending(&both)], &seen);
+        assert_eq!(flat(&repairs), ["ALTER ROLE \"r\" CONNECTION LIMIT 3 VALID UNTIL 'infinity';"]);
+        assert_eq!(upsert(&write, "r").unwrap().attributes.valid_until, None, "the PATCH's expiry");
+
+        let mut settled = pending(&[RoleField::ConnectionLimit]);
+        settled.attributes_pending = false;
+        settled.pending = false;
+        let (repairs, write) = plan_resync(OWNER_ROLE, &[settled], &seen);
+        assert!(repairs.is_empty(), "{repairs:?}");
+        assert_eq!(upsert(&write, "r").unwrap().attributes, o.attributes());
+    }
+
     // U1, E32: an API change the compute never confirmed is driven by the resync: a NOLOGIN
     // row's role loses the password and LOGIN it still has, gets the wanted attributes, its
     // wanted memberships granted and the owner's other grants revoked. A wanted group that
@@ -3045,6 +3256,7 @@ mod tests {
                 api_owner_level: false,
                 attributes: RoleAttributes::default(),
                 attributes_pending: false,
+                attributes_named: chelabase_metadata::RoleField::all(),
                 attributes_change_id: None,
             },
         );
@@ -3164,6 +3376,7 @@ mod tests {
                     api_owner_level: false,
                     attributes: RoleAttributes::default(),
                     attributes_pending: false,
+                    attributes_named: chelabase_metadata::RoleField::all(),
                     attributes_change_id: None,
                 },
             );
@@ -3179,6 +3392,7 @@ mod tests {
                     api_owner_level: false,
                     attributes: RoleAttributes::default(),
                     attributes_pending: false,
+                    attributes_named: chelabase_metadata::RoleField::all(),
                     attributes_change_id: None,
                 },
             );

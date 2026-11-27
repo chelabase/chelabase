@@ -22,6 +22,7 @@ fn personal(name: &str, member_of: &[&str]) -> RoleCopy {
         api_owner_level: false,
         pending: false,
         attributes_pending: false,
+        attributes_named: chelabase_metadata::RoleField::all(),
         created_at: Timestamp::UNIX_EPOCH,
         attributes: RoleAttributes {
             member_of: member_of.iter().map(|g| g.to_string()).collect(),

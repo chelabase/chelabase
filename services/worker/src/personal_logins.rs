@@ -593,6 +593,7 @@ mod tests {
             api_owner_level: false,
             pending: false,
             attributes_pending: false,
+            attributes_named: chelabase_metadata::RoleField::all(),
             created_at: Timestamp::UNIX_EPOCH,
             attributes: RoleAttributes::default(),
         }

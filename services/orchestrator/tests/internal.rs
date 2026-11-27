@@ -209,6 +209,7 @@ fn copy(name: &str, origin: RoleOrigin, verifier: Option<&str>, sealed: Option<&
         api_owner_level: false,
         pending: false,
         attributes_pending: false,
+        attributes_named: chelabase_metadata::RoleField::all(),
         created_at: Timestamp::now(),
         attributes: chelabase_metadata::RoleAttributes::default(),
     }

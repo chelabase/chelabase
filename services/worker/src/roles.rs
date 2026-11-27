@@ -10,7 +10,7 @@ use std::time::Duration;
 use anyhow::Context;
 use chelabase_metadata::{
     ApiRoleChange, BranchKind, BranchStatus, InsertRoleOutcome, NewApiRole, RenameCopyOutcome,
-    RoleAttributes, RoleCopy, RoleOrigin, RoleWriteOutcome, SecretChange,
+    RoleAttributes, RoleCopy, RoleField, RoleOrigin, RoleWriteOutcome, SecretChange,
 };
 use chelabase_nats::{
     KeyRef, RESET_NOT_APPLIED, ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED,
@@ -235,6 +235,22 @@ pub struct RolePatch {
 }
 
 impl RolePatch {
+    /// The fields this change sets (#425): only these are driven while it's pending.
+    pub fn named(&self) -> std::collections::BTreeSet<RoleField> {
+        [
+            (self.owner_level.is_some(), RoleField::OwnerLevel),
+            (self.login.is_some(), RoleField::Login),
+            (self.inherit.is_some(), RoleField::Inherit),
+            (self.connection_limit.is_some(), RoleField::ConnectionLimit),
+            (self.valid_until.is_some(), RoleField::ValidUntil),
+            (self.bypass_rls.is_some(), RoleField::BypassRls),
+            (self.member_of.is_some(), RoleField::MemberOf),
+        ]
+        .into_iter()
+        .filter_map(|(set, field)| set.then_some(field))
+        .collect()
+    }
+
     /// `current` with this change.
     pub fn apply(&self, current: &RoleAttributes) -> RoleAttributes {
         let member_of = match &self.member_of {
@@ -390,9 +406,10 @@ pub(crate) struct RoleState {
 }
 
 /// Where a change to a role starts (E32, "SQL controls everything"): the catalog's state
-/// (`observed`), except for a role made through the API whose last API change the compute
-/// hasn't confirmed (`attributes_pending`) or that the compute doesn't have: then the stored
-/// wanted state, so that change isn't lost. A role without an API row is the user's only when
+/// (`observed`), except for a role made through the API that the compute doesn't have (then
+/// the stored wanted state) or whose last API change the compute hasn't confirmed
+/// (`attributes_pending`): then the fields that change named are the stored ones (#425), so
+/// it isn't lost, and the rest the catalog's. A role without an API row is the user's only when
 /// the owner administers it (made by the owner, or granted to it with ADMIN); any other, or
 /// one that exists nowhere, is [`RoleOutcome::NotFound`]. The merge's phase 0 (and its
 /// rehearsal) use it the same way.
@@ -403,7 +420,16 @@ pub(crate) fn current_role_state(
     let api_row = row.filter(|r| r.origin == RoleOrigin::Api);
     match (api_row, observed) {
         (Some(r), Some(o)) if !r.attributes_pending => Ok(observed_state(o)),
-        (Some(r), _) => Ok(RoleState {
+        // #425: only the fields the pending change named; the rest are the catalog's.
+        (Some(r), Some(o)) => {
+            let (owner_level, login, attributes) = crate::resync::pending_wanted(r, o);
+            Ok(RoleState {
+                owner_level,
+                login,
+                attributes,
+            })
+        }
+        (Some(r), None) => Ok(RoleState {
             owner_level: r.api_owner_level,
             login: r.login,
             attributes: r.attributes.clone(),
@@ -801,7 +827,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // T14 M1: a stored group dropped in SQL since isn't wanted any more (the catalog's
         // state only lists groups that exist).
         let unchecked = patch.member_of.is_none()
-            && api_row.is_some_and(|r| r.attributes_pending || observed.is_none());
+            && api_row.is_some_and(|r| {
+                (r.attributes_pending && r.attributes_named.contains(&RoleField::MemberOf))
+                    || observed.is_none()
+            });
         if unchecked && !attributes.member_of.is_empty() {
             let found = match self
                 .membership_targets(&ep, &database, &attributes.member_of)
@@ -841,6 +870,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let has_row = if let Some(change_id) = change_id {
             let change = ApiRoleChange {
                 change_id,
+                named: patch.named(),
                 owner_level: wanted_owner_level,
                 login: wanted_login,
                 attributes: wanted_attributes.clone(),
@@ -2344,6 +2374,7 @@ mod tests {
                 api_owner_level: false,
                 attributes: chelabase_metadata::RoleAttributes::default(),
                 attributes_pending: false,
+                attributes_named: chelabase_metadata::RoleField::all(),
                 attributes_change_id: None,
             },
         );
@@ -3166,6 +3197,7 @@ mod tests {
                     api_owner_level: false,
                     attributes: chelabase_metadata::RoleAttributes::default(),
                     attributes_pending: false,
+                    attributes_named: chelabase_metadata::RoleField::all(),
                     attributes_change_id: None,
                 },
             );
@@ -4119,6 +4151,49 @@ mod tests {
         assert_eq!(attributes(&w, &ep, "app").member_of, Vec::<String>::new());
     }
 
+    /// #425: a PATCH over an earlier one the compute hasn't confirmed, which named only the
+    /// connection limit, starts from the catalog for every other field: an expiry set in SQL
+    /// since (`-infinity`) is left alone, the earlier limit is still driven, and the row's
+    /// named fields join both changes'.
+    #[tokio::test]
+    async fn a_patch_over_a_pending_one_leaves_what_neither_named() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = ready(&w, &journal).await;
+        assert_eq!(w.create_role(branch, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        let verifier = login(&w, &ep, "app").unwrap().0;
+        {
+            let mut state = w.metadata.state();
+            let row = state.endpoints.get_mut(&ep).unwrap().logins.get_mut("app").unwrap();
+            row.attributes_pending = true;
+            row.attributes_named = [RoleField::ConnectionLimit].into();
+            row.attributes.connection_limit = 5;
+        }
+        let mut expired = observed("app", true, verifier.as_deref());
+        expired.valid_until = Some(Timestamp::PG_ROUND_TRIP_MIN);
+        in_catalog(&w, &expired);
+        w.computes.sql.lock().unwrap().clear();
+        // The confirm loses (a receiver write meanwhile): the row stays as written.
+        w.metadata.state().confirm_version_moves = true;
+        let patch = RolePatch {
+            inherit: Some(false),
+            ..RolePatch::default()
+        };
+
+        assert_eq!(w.update_role(branch, "app", &patch).await, RoleOutcome::Ok);
+
+        assert_eq!(
+            sql(&w).last().unwrap(),
+            "SET search_path = pg_catalog, pg_temp;\nALTER ROLE \"app\" NOINHERIT CONNECTION LIMIT 5;"
+        );
+        let row = w.metadata.state().endpoints[&ep].logins["app"].clone();
+        assert_eq!(row.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "the SQL expiry");
+        assert_eq!(
+            row.attributes_named,
+            [RoleField::Inherit, RoleField::ConnectionLimit].into(),
+            "both changes' fields"
+        );
+    }
+
     /// I3/I4 helpers for the merge (F3): the stored-or-catalog starting point, exhaustively.
     #[test]
     fn a_roles_current_state_follows_the_catalog_unless_a_change_is_pending() {
@@ -4132,6 +4207,7 @@ mod tests {
             api_owner_level: true,
             pending,
             attributes_pending: pending,
+            attributes_named: chelabase_metadata::RoleField::all(),
             created_at: Timestamp::now(),
             attributes: chelabase_metadata::RoleAttributes {
                 connection_limit: 7,
@@ -4558,6 +4634,7 @@ mod tests {
                     api_owner_level: false,
                     attributes: chelabase_metadata::RoleAttributes::default(),
                     attributes_pending: false,
+                    attributes_named: chelabase_metadata::RoleField::all(),
                     attributes_change_id: None,
                 },
             );

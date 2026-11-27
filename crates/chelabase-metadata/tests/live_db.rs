@@ -22,7 +22,7 @@ use chelabase_metadata::{
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
 use chelabase_metadata::{
-    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleField, RoleWriteOutcome, SecretChange,
 };
 use chelabase_metadata::members::Admission;
 use chelabase_time::{Timestamp, TimestampExt};
@@ -4004,6 +4004,7 @@ async fn rows_written_before_the_swap_read_back_equal() {
             attributes,
             secret: SecretChange::Keep,
             change_id: uuid::Uuid::new_v4(),
+            named: RoleField::all(),
         };
         client.update_api_role(&ep, "kept", &change, 10).await.unwrap();
         let same: bool = sqlx::query_scalar(
@@ -4087,6 +4088,7 @@ async fn api_role_attributes_insert_and_update() {
         attributes: member.clone(),
         secret: SecretChange::Set("SCRAM-SHA-256$n".into(), "v1:n".into()),
         change_id: uuid::Uuid::new_v4(),
+        named: RoleField::all(),
     };
     let updated = client.update_api_role(&ep, "readers", &change, 10).await.unwrap();
     let missing = client.update_api_role(&ep, "ghost", &change, 10).await.unwrap();
@@ -8509,6 +8511,7 @@ async fn login_on_respects_the_cap() {
         attributes: plain.clone(),
         secret: SecretChange::Set("SCRAM-SHA-256$n".into(), "v1:n".into()),
         change_id: uuid::Uuid::new_v4(),
+        named: RoleField::all(),
     };
     let first = client.update_api_role(&ep, "g1", &on, 2).await.unwrap();
     let second = client.update_api_role(&ep, "g2", &on, 2).await.unwrap();
@@ -8563,7 +8566,7 @@ async fn attributes_pending_follows_api_writes() {
     let (after_confirm, _, _) = state(client.clone(), ep.clone()).await;
     client.replace_role_secret(&ep, "app", "SCRAM-SHA-256$b", "v1:b").await.unwrap();
     let (after_reset, _, _) = state(client.clone(), ep.clone()).await;
-    let change = ApiRoleChange { owner_level: false, login: true, attributes: RoleAttributes::default(), secret: SecretChange::Keep, change_id: uuid::Uuid::new_v4() };
+    let change = ApiRoleChange { owner_level: false, login: true, attributes: RoleAttributes::default(), secret: SecretChange::Keep, change_id: uuid::Uuid::new_v4(), named: RoleField::all() };
     client.update_api_role(&ep, "app", &change, 10).await.unwrap();
     let (after_patch, _, v) = state(client.clone(), ep.clone()).await;
     let mut recorded = upsert("app", RoleOrigin::Api, "SCRAM-SHA-256$b");
@@ -8616,7 +8619,7 @@ async fn confirm_clears_attributes_by_change_id() {
     let after_lost = flags(client.clone(), ep.clone()).await;
     // A newer change, then a confirm of the older one.
     let second = uuid::Uuid::new_v4();
-    let change = ApiRoleChange { owner_level: false, login: false, attributes: plain.clone(), secret: SecretChange::Keep, change_id: second };
+    let change = ApiRoleChange { owner_level: false, login: false, attributes: plain.clone(), secret: SecretChange::Keep, change_id: second, named: RoleField::all() };
     client.update_api_role(&ep, "app", &change, 10).await.unwrap();
     let (_, v) = client.role_copies(&ep).await.unwrap();
     // The stale confirm carries what its own (older) write read: the first version and id.

@@ -18,6 +18,7 @@ fn login(origin: RoleOrigin) -> FakeLogin {
         api_owner_level: false,
         attributes: Default::default(),
         attributes_pending: false,
+        attributes_named: chelabase_metadata::RoleField::all(),
         attributes_change_id: None,
     }
 }

@@ -16,7 +16,8 @@ use chelabase_metadata::{
     RoleLevel, RoleOrigin, SchemaBase, SealedChange,
 };
 use chelabase_metadata::{
-    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleField, RoleWriteOutcome,
+    SecretChange,
 };
 use chelabase_metadata::{
     BranchBusy, ClaimOutcome, MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch,
@@ -102,6 +103,8 @@ pub struct FakeLogin {
     pub attributes_pending: bool,
     /// The API write that set `attributes_pending` (`attributes_change_id`).
     pub attributes_change_id: Option<uuid::Uuid>,
+    /// The fields the pending change named (`attributes_named`, #425).
+    pub attributes_named: std::collections::BTreeSet<RoleField>,
 }
 
 impl FakeLogin {
@@ -117,6 +120,7 @@ impl FakeLogin {
             attributes: RoleAttributes::default(),
             attributes_pending: false,
             attributes_change_id: None,
+            attributes_named: RoleField::all(),
         }
     }
 }
@@ -997,6 +1001,7 @@ impl WorkerMetadata for FakeMetadata {
                             api_owner_level: l.api_owner_level,
                             attributes: l.attributes.clone(),
                             attributes_pending: false,
+                            attributes_named: chelabase_metadata::RoleField::all(),
                             attributes_change_id: None,
                         };
                         (l.name.to_string(), login)
@@ -1362,6 +1367,7 @@ impl WorkerMetadata for FakeMetadata {
                 attributes: role.attributes.clone(),
                 attributes_pending: true,
                 attributes_change_id: Some(role.change_id),
+                attributes_named: RoleField::all(),
             },
         );
         ep.roles_version += 1;
@@ -1402,6 +1408,12 @@ impl WorkerMetadata for FakeMetadata {
         row.login = change.login;
         row.attributes = change.attributes.clone();
         row.pending = true;
+        // Joined to an earlier change that's still pending, so neither is lost (#425).
+        if row.attributes_pending {
+            row.attributes_named.extend(change.named.iter().copied());
+        } else {
+            row.attributes_named = change.named.clone();
+        }
         row.attributes_pending = true;
         row.attributes_change_id = Some(change.change_id);
         match &change.secret {
@@ -1647,6 +1659,7 @@ impl WorkerMetadata for FakeMetadata {
                 attributes: up.attributes.clone(),
                 attributes_pending: false,
                 attributes_change_id: None,
+                attributes_named: RoleField::all(),
             });
             row.password_enc = match &up.password_enc {
                 SealedChange::Keep => row.password_enc,
@@ -3360,6 +3373,7 @@ fn fake_copies(ep: &FakeEndpoint) -> Vec<RoleCopy> {
         api_owner_level: false,
         pending: false,
         attributes_pending: false,
+        attributes_named: RoleField::all(),
         created_at: at,
         attributes: RoleAttributes::default(),
     });
@@ -3376,6 +3390,7 @@ fn fake_copies(ep: &FakeEndpoint) -> Vec<RoleCopy> {
             api_owner_level: l.api_owner_level,
             pending: l.pending,
             attributes_pending: l.attributes_pending,
+            attributes_named: l.attributes_named.clone(),
             created_at: at,
             attributes: l.attributes.clone(),
         })

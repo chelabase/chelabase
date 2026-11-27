@@ -69,7 +69,7 @@ pub use neon::{
     BranchDatabase, CopyUpsert, DataApiState, DatabaseOrigin, EnableStart, ENDPOINT_LOCK_TIMEOUT, EndpointLock,
     EndpointState, InsertRoleOutcome, NeonDatabase, NeonEndpoint, NeonRole, NewEndpoint,
     NewRoleCopy, NewStaticEndpoint, ObservedDatabase, PasswordState, ResyncApplied, ResyncWrite, RoleCopy,
-    RoleLevel, RoleOrigin, RoleRow, SealedChange,
+    RoleField, RoleLevel, RoleOrigin, RoleRow, SealedChange,
 };
 pub use neon::{
     ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
@@ -504,7 +504,7 @@ impl MetadataClient {
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261123000001).
+        // this file when adding one (last: 20261127000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
