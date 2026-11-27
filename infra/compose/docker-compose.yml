@@ -1326,7 +1326,7 @@ services:
   # /health, which waits for the OIDC audiences. It verifies the gateway's identity on ticket
   # requests.
   realtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:6acee4e47d0bb5717ec2f2004241406e8842bc0eb86522a313c2cbeabc44d293}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:3f0eaa1decd58f807cfad74be88d89a70dfb36fd84c06398958583dae305860a}
     restart: unless-stopped
     # S1: its own credentials, from its own files below; Valkey TLS is platform mode's (S7).
     environment:
