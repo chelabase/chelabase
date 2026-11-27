@@ -1166,13 +1166,17 @@ SELECT pg_catalog.set_config('chelabase_fn.fresh', (NOT EXISTS (SELECT FROM pg_t
   JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name
   JOIN pg_catalog.pg_trigger tg ON tg.tgrelid = c.oid WHERE {EXACT}))::pg_catalog.text, true) IS NULL;
 -- #301: `stale`: events, if any, that a previous form of the trigger captured, under a role
--- that may no longer be its function's: a database trigger under its name that records
--- another run-as OID (whatever the row's state: the change may have committed between the
--- worker's reads), or a pending row with no database trigger exactly in place (the old one
--- is gone). The dispatcher held them while the row was pending; the cleanup below removes and
+-- that may no longer be its function's: a database trigger under its name on its own table
+-- that runs `enqueue()` with other arguments, another run-as OID (whatever the row's state:
+-- the change may have committed between the worker's reads; a namesake on another table, or
+-- of another function, is no previous form and stales nothing), or a pending row with no
+-- database trigger exactly in place (the old one is gone). The dispatcher held them while the row was pending; the cleanup below removes and
 -- counts them, so they are never delivered. Read before the loops replace the trigger.
 UPDATE pg_temp.chelabase_fn_wanted w SET stale = EXISTS (SELECT FROM pg_catalog.pg_trigger tg
+    JOIN pg_catalog.pg_class c ON c.oid = tg.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
     WHERE tg.tgname = w.name AND NOT tg.tgisinternal
+      AND n.nspname = w.schema_name AND c.relname = w.table_name
+      AND tg.tgfoid = pg_catalog.to_regprocedure('chelabase_functions.enqueue()')
       AND tg.tgargs IS DISTINCT FROM {ARGS})
   OR (w.pending AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n
   JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid AND c.relname = w.table_name
@@ -2053,8 +2057,9 @@ mod tests {
         assert!(stale < sql.find("EXECUTE pg_catalog.format('DROP TRIGGER").unwrap());
         assert!(sql.contains("WHERE NOT w.stale AND NOT EXISTS ("));
         // Audit S1: a database trigger under the wanted name recording other arguments (another
-        // run-as OID) is stale whatever the row's state.
-        assert!(sql.contains("tg.tgname = w.name AND NOT tg.tgisinternal\n      AND tg.tgargs IS DISTINCT FROM (pg_catalog.convert_to(w.trigger_id"));
+        // run-as OID) is stale whatever the row's state; audit R2-1: only one on the wanted
+        // row's own table that runs `enqueue()`.
+        assert!(sql.contains("WHERE tg.tgname = w.name AND NOT tg.tgisinternal\n      AND n.nspname = w.schema_name AND c.relname = w.table_name\n      AND tg.tgfoid = pg_catalog.to_regprocedure('chelabase_functions.enqueue()')\n      AND tg.tgargs IS DISTINCT FROM (pg_catalog.convert_to(w.trigger_id"));
         assert!(drop_triggers_sql().contains("pg_catalog.format('DROP TRIGGER %I ON %I.%I'"));
         let role = sql
             .find("SET LOCAL ROLE chelabase_functions_owner;")

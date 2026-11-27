@@ -2166,12 +2166,12 @@ mod functions {
                 pairs.push((p, w));
             }
         }
-        // #301: the run-as writes that pend trigger rows against the other writers of several
-        // trigger rows (all lock them in id order).
+        // #301: the run-as writes that pend trigger rows, and a function delete's cascade (audit
+        // R2-3), against the other writers of several trigger rows (all lock them in id order).
         let pick = |names: &[&str]| -> Vec<(&'static str, Op)> {
             function_writes().into_iter().filter(|(n, _)| names.contains(n)).collect()
         };
-        for w in pick(&["set_run_as", "clear_run_as", "settle_run_as_mint_unmintable"]) {
+        for w in pick(&["set_run_as", "clear_run_as", "settle_run_as_mint_unmintable", "delete_function_unprotected"]) {
             for p in pick(&["update_trigger", "delete_trigger", "record_trigger_deliveries", "settle_trigger_installs"]) {
                 pairs.push((w, p));
                 pairs.push((p, w));

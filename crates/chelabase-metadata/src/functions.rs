@@ -28,7 +28,7 @@
 //!
 //! #301: every writer of several trigger rows (4b) in one statement locks them in id order
 //! (`ORDER BY id FOR UPDATE`): the run-as pend, a reset's or restore's pend, a tombstone's
-//! purge, the worker's settle and the delivery record. So two of them never wait on each other in a cycle.
+//! purge, a function delete (before its cascade), the worker's settle and the delivery record. So two of them never wait on each other in a cycle.
 //!
 //! No writer takes a row of a lower number while holding a higher one: no writer of an
 //! endpoint or key row (5, 6) touches 3 or 4 afterwards, and `set_run_as` takes the endpoint
@@ -683,6 +683,12 @@ async fn delete_locked_function(
     tx: &mut Transaction<'static, Postgres>,
     function: Uuid,
 ) -> Result<(), MetadataError> {
+    // #301 (audit R2-3): the trigger rows the cascade deletes, locked first in id order, as
+    // every writer of several trigger rows takes them (module docs).
+    sqlx::query("SELECT 1 FROM function_triggers WHERE function_id = $1 ORDER BY id FOR UPDATE")
+        .bind(function)
+        .execute(&mut **tx)
+        .await?;
     // m13: drop, then forget. The cascade below deletes the trigger rows; their database
     // triggers are dropped by the worker from these rows (4c, an insert that locks nothing).
     sqlx::query(

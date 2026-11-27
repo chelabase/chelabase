@@ -2691,6 +2691,38 @@ mod fn_triggers {
         .await;
     }
 
+    /// #301 audit R2-1: a role with no rights on the triggered table makes, on a table of its
+    /// own, a trigger under a wanted trigger's name. The sync drops the namesake as before,
+    /// and removes none of the events the real trigger queued (captured under the function's
+    /// current run-as role, which didn't change): a namesake on another table is no previous
+    /// form of the trigger.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn a_namesake_trigger_on_another_table_drops_no_events() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE ROLE ra NOLOGIN; GRANT SELECT ON public.orders TO ra;
+                          CREATE ROLE squatter NOLOGIN; CREATE SCHEMA sq AUTHORIZATION squatter;").await;
+            let f = fx.function_without_run_as("hello").await;
+            fx.set_run_as(main, f, "ra").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(verdict(fx, t).await, INSTALLED);
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2)").await;
+            assert_eq!(queued(fx, t).await, 2);
+            fx.sql(main, &format!(
+                "SET ROLE squatter; CREATE TABLE sq.mine (id int);
+                 CREATE TRIGGER {} BEFORE UPDATE ON sq.mine FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+                 RESET ROLE;", trigger_name(t)
+            )).await;
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!(verdict(fx, t).await, INSTALLED);
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]), "the namesake is dropped");
+            assert_eq!((queued(fx, t).await, trigger_row(fx, t).await.dropped_count), (2, 0), "no event is dropped");
+        })
+        .await;
+    }
+
     /// #301 AC 1 (cleared): clearing the run-as role pends the trigger at once, and the next
     /// sync drops its database trigger, removes and counts its queued events and settles it
     /// `run_as_role_required`.
