@@ -2742,6 +2742,123 @@ mod fn_triggers {
         .await;
     }
 
+    /// #301: the database trigger's run-as OID for trigger `id` now (`None`: no database
+    /// trigger), then `INSERT INTO public.<table> VALUES (<row>)`: what the event was captured
+    /// under.
+    async fn capture(fx: &Fx, table: &str, id: Uuid, row: i64) -> Option<i64> {
+        let oid = db_trigger_run_as(fx, id).await.parse().ok();
+        fx.sql(fx.main, &format!("INSERT INTO public.{table} VALUES ({row})")).await;
+        oid
+    }
+
+    /// #301: the rows of trigger `id`'s queued events, in queue order.
+    async fn queued_rows(fx: &Fx, id: Uuid) -> Vec<i64> {
+        fx.value(fx.main, &format!(
+            "SELECT coalesce(string_agg(payload->'record'->>'id', ',' ORDER BY id), '')
+             FROM chelabase_functions.outbox WHERE trigger_id = '{id}'"
+        ))
+        .await
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap())
+        .collect()
+    }
+
+    /// #301 (audit S1, B1): the invariant "an `installed` table trigger's outbox holds only
+    /// events captured under its function's current run-as OID", exhaustively over where a
+    /// run-as change lands in one sync pass (before it, between its two metadata reads, or
+    /// after its scripts and before its settle), what it changes to (the same role, another
+    /// role that can read, one that can't, cleared) and the row's state when it lands
+    /// (`installed`, or already pending after an earlier change). Each event is tagged with
+    /// the run-as OID its database trigger recorded when it was captured. After two more
+    /// passes the row is settled for the final role (installed, or failed with the right
+    /// reason with nothing queued), and an event captured under that role then is queued.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn run_as_change_at_any_point_of_a_sync_keeps_the_invariant() {
+        use worker::fn_triggers::SyncPoint;
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE ROLE ra NOLOGIN; CREATE ROLE rb NOLOGIN; CREATE ROLE rn NOLOGIN;").await;
+            let mut oid = std::collections::HashMap::new();
+            for role in ["ra", "rb", "rn"] {
+                oid.insert(role, fx.role_oid(main, role).await);
+            }
+            let points = [None, Some(SyncPoint::AfterTriggersRead), Some(SyncPoint::BeforeSettle)];
+            let changes = [Some("ra"), Some("rb"), Some("rn"), None];
+            let mut failures = Vec::new();
+            let mut i = 0;
+            for pending in [false, true] {
+                for point in points {
+                    for change in changes {
+                        i += 1;
+                        let case = format!("pending {pending}, at {point:?}, to {change:?}");
+                        let table = format!("ilv_{i}");
+                        fx.sql(main, &format!("CREATE TABLE public.{table} (id int); GRANT SELECT ON public.{table} TO ra, rb;")).await;
+                        let f = fx.function_without_run_as(&format!("ilv-{i}")).await;
+                        fx.set_run_as(main, f, "ra").await;
+                        let t = fx.trigger(main, f, &table, &["insert"]).await;
+                        fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                        assert_eq!(verdict(fx, t).await, INSTALLED, "{case}");
+                        let mut tags = std::collections::HashMap::new();
+                        tags.insert(1, capture(fx, &table, t, 1).await);
+                        if pending {
+                            fx.set_run_as(main, f, "rb").await;
+                            tags.insert(2, capture(fx, &table, t, 2).await);
+                        }
+                        let apply = move || async move {
+                            match change {
+                                Some(role) => fx.set_run_as(main, f, role).await,
+                                None => assert!(fx.metadata.set_run_as(main, f, None).await.unwrap()),
+                            }
+                        };
+                        match point {
+                            None => {
+                                apply().await;
+                                fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                            }
+                            Some(at) => {
+                                let hook = move |p: SyncPoint| -> futures_util::future::BoxFuture<'static, ()> {
+                                    Box::pin(async move {
+                                        if p == at {
+                                            apply().await;
+                                        }
+                                    })
+                                };
+                                fx.worker.sync_fn_triggers_at(main, false, &hook).await.unwrap();
+                            }
+                        }
+                        tags.insert(3, capture(fx, &table, t, 3).await);
+                        for _ in 0..2 {
+                            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                        }
+                        tags.insert(4, capture(fx, &table, t, 4).await);
+                        let (state, error) = verdict(fx, t).await;
+                        let queued = queued_rows(fx, t).await;
+                        let current = change.filter(|r| *r != "rn").map(|r| oid[r]);
+                        let expected = match change {
+                            Some("rn") => failed(CANNOT_READ),
+                            None => failed("run_as_role_required"),
+                            _ => INSTALLED,
+                        };
+                        if (state, error.clone()) != expected {
+                            failures.push(format!("{case}: settled {state:?} {error:?}, expected {expected:?}"));
+                        }
+                        let foreign: Vec<i64> = queued.iter().copied().filter(|r| tags[r] != current || current.is_none()).collect();
+                        if !foreign.is_empty() {
+                            failures.push(format!("{case}: {state:?} with events captured under another role queued: {foreign:?} (tags {tags:?})"));
+                        }
+                        if state == TriggerState::Installed && !queued.contains(&4) {
+                            failures.push(format!("{case}: installed but the event captured after the passes isn't queued: {queued:?}"));
+                        }
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        })
+        .await;
+    }
+
     /// m17: the read rule ([`run_as_reads`]) checked exhaustively against Postgres itself.
     /// For every combination of a role's grant (none, a column, the table, through an
     /// inherited or a NOINHERIT membership, membership in `pg_read_all_data`), its attributes

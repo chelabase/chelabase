@@ -26,6 +26,10 @@
 //! | 5 | `neon_endpoints` | `FOR SHARE`, the branch's (run-as key) | DDL receiver, `delete_role_copy`, `rename_role_copy` `FOR UPDATE`; secret key create and rotate `FOR SHARE` |
 //! | 6 | `data_api_keys` | `UPDATE`/`INSERT` (run-as key, function delete) | the endpoint writers above, revoke, resync; tombstone purge (revokes the branches' managed keys, after 4) |
 //!
+//! #301: every writer of several trigger rows (4b) in one statement locks them in id order
+//! (`ORDER BY id FOR UPDATE`): the run-as pend, a reset's or restore's pend, a tombstone's
+//! purge, the worker's settle and the delivery record. So two of them never wait on each other in a cycle.
+//!
 //! No writer takes a row of a lower number while holding a higher one: no writer of an
 //! endpoint or key row (5, 6) touches 3 or 4 afterwards, and `set_run_as` takes the endpoint
 //! (5) before it revokes or inserts a key (6); the worker's guarded run-as mint
@@ -767,7 +771,8 @@ pub(crate) async fn pend_table_triggers(
     sqlx::query(
         "UPDATE function_triggers
          SET state = 'pending_install', enabled_since = clock_timestamp(), last_error = NULL
-         WHERE branch_id = $1 AND source = 'table'",
+         WHERE id IN (SELECT id FROM function_triggers WHERE branch_id = $1 AND source = 'table'
+                      ORDER BY id FOR UPDATE)",
     )
     .bind(branch)
     .execute(&mut *tx)
@@ -777,13 +782,15 @@ pub(crate) async fn pend_table_triggers(
 
 /// #301: in a transaction that changed (or cleared, or settled unmintable) `function`'s run-as
 /// role on `branch`, holding its branch-function locks and state row: every enabled table
-/// trigger of the function there that is `installed` or `failed` goes back to
-/// `pending_install` with a new `enabled_since` and no error. The dispatcher holds a pending
-/// trigger's events, so nothing captured under the previous role is delivered; the worker's
-/// next sync replaces the database trigger for the new role (removing what the old one
-/// queued) or settles the row, and a `failed` row is checked again. A disabled row is pended
-/// when it is turned on. Lock order (module docs): trigger rows (4b) after the state row (4),
-/// before the endpoint (5).
+/// trigger of the function there, whatever its state, goes back to `pending_install` with a
+/// new `enabled_since` and no error, as [`pend_table_triggers`] does for a reset. The
+/// dispatcher holds a pending trigger's events, so nothing captured under the previous role
+/// is delivered; a sync that read a row before the change settles nothing (its
+/// `enabled_since` no longer matches, even for a row that was already pending); the next
+/// sync replaces the database trigger for the new role (removing what the old one queued) or
+/// settles the row, and a `failed` row is checked again. A disabled row is pended when it is
+/// turned on. Lock order (module docs): trigger rows (4b), in id order, after the state row
+/// (4), before the endpoint (5).
 async fn pend_function_table_triggers(
     tx: &mut PgConnection,
     branch: BranchId,
@@ -792,8 +799,9 @@ async fn pend_function_table_triggers(
     sqlx::query(
         "UPDATE function_triggers
          SET state = 'pending_install', enabled_since = clock_timestamp(), last_error = NULL
-         WHERE branch_id = $1 AND function_id = $2 AND source = 'table' AND enabled
-           AND state IN ('installed', 'failed')",
+         WHERE id IN (SELECT id FROM function_triggers
+                      WHERE branch_id = $1 AND function_id = $2 AND source = 'table' AND enabled
+                      ORDER BY id FOR UPDATE)",
     )
     .bind(branch.as_uuid())
     .bind(function_id)
@@ -891,6 +899,11 @@ pub(crate) async fn purge_branch_functions(
     tx: &mut PgConnection,
     branches: &[Uuid],
 ) -> Result<(), MetadataError> {
+    // #301: the trigger rows in id order, as every writer of several of them takes them.
+    sqlx::query("SELECT 1 FROM function_triggers WHERE branch_id = ANY($1) ORDER BY id FOR UPDATE")
+        .bind(branches)
+        .execute(&mut *tx)
+        .await?;
     for table in [
         "branch_function_secrets",
         "function_schedules",
@@ -2512,7 +2525,9 @@ impl MetadataClient {
                  last_delivered_at = CASE WHEN d.delivered THEN now() ELSE t.last_delivered_at END
              FROM unnest($2::uuid[], $3::bool[], $4::bigint[], $5::text[], $6::bigint[])
                   AS d(id, delivered, dead, error, dropped)
-             WHERE t.id = d.id AND t.branch_id = $1",
+             WHERE t.id = d.id AND t.branch_id = $1
+               AND t.id IN (SELECT id FROM function_triggers WHERE branch_id = $1 AND id = ANY($2)
+                            ORDER BY id FOR UPDATE)",
         )
         .bind(branch.as_uuid())
         .bind(ids)
@@ -2632,7 +2647,9 @@ impl MetadataClient {
              FROM unnest($2::uuid[], $3::timestamptz[], $4::text[]) AS i(id, since, error)
              WHERE t.id = i.id AND t.branch_id = $1 AND t.source = 'table'
                AND (t.state = 'pending_install' OR (t.state = 'installed' AND i.error IS NOT NULL))
-               AND t.enabled_since = i.since",
+               AND t.enabled_since = i.since
+               AND t.id IN (SELECT id FROM function_triggers WHERE branch_id = $1 AND id = ANY($2)
+                            ORDER BY id FOR UPDATE)",
         )
         .bind(branch.as_uuid())
         .bind(ids)
