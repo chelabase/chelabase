@@ -160,7 +160,7 @@ A merge that fails while running (`failed`, `stale`) shows its reason in the mer
 | 409 | `email_taken` | Another user has this email. On sign-up this happens only when email verification is off. |
 | 401 | `invalid_credentials` | Wrong email or password, or the current password is wrong. |
 | 401 | `refresh_token_invalid` | The refresh token is invalid. |
-| 401 | `refresh_token_reused` | The refresh token was used already; the session is revoked. |
+| 401 | `refresh_token_reused` | The refresh token was used already; every session of the user is revoked. |
 | 401 | `user_token_invalid` | No user token, or an invalid one. |
 | 403 | `email_not_verified` | The email isn't verified. |
 | 403 | `user_inactive` | The user is deactivated or locked. |
