@@ -590,7 +590,8 @@ pass "from the host: psql (verify-full, the CA from docker compose cp) created a
 step "the default install has no outbound name resolution"
 # Production installs run no `compute-egress` (its profile is off): the compute's resolver is pinned
 # at the egress address, where nothing listens, so an outside name must fail to resolve. The bound:
-# the lookup is wrapped in `timeout 30` and has to fail (not resolve) inside it; a name of the
+# the compute carries the resolver options `timeout:1 attempts:1`, so the lookup is wrapped in
+# `timeout 20` and has to fail (not resolve) inside 10 s (about 4 s; glibc defaults took 32 s); a name of the
 # stack itself still resolves through Docker's own resolver.
 [[ -z "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=compute-egress")" ]] ||
   die "the default install runs a compute-egress container"
@@ -600,13 +601,13 @@ want_dns="$(sed -n 's/^CHELABASE_COMPUTE_EGRESS_IP=//p' "$tmp/$PROJECT.env")"
 [[ "$(docker inspect -f '{{range .HostConfig.Dns}}{{.}} {{end}}' "$compute_c")" == "$want_dns " ]] ||
   die "the compute's resolver is not the pinned egress address $want_dns"
 lookup_start=$SECONDS
-if timeout 30 docker exec "$compute_c" getent hosts example.com >/dev/null 2>&1; then
+if timeout 20 docker exec "$compute_c" getent hosts example.com >/dev/null 2>&1; then
   die "the compute resolved example.com in the default install"
 fi
 lookup_secs=$((SECONDS - lookup_start))
-((lookup_secs < 30)) || die "the lookup of an outside name didn't fail within the 30 s bound"
+((lookup_secs < 10)) || die "the lookup of an outside name didn't fail within the 10 s bound (took $lookup_secs s)"
 docker exec "$compute_c" getent hosts orchestrator >/dev/null 2>&1 || die "the compute can't resolve a name of the stack (orchestrator)"
-pass "the default install: an outside name doesn't resolve from the compute (failed in $lookup_secs s, bound 30 s), stack names do"
+pass "the default install: an outside name doesn't resolve from the compute (failed in $lookup_secs s, bound 10 s), stack names do"
 
 # ---- 7b. object storage --------------------------------------------------------------------------
 
