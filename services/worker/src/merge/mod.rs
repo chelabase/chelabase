@@ -134,6 +134,26 @@ pub(crate) fn stored_plan(merge: &MergeRecord) -> Result<StoredPlan, String> {
     Ok(stored)
 }
 
+/// Why `plan` can't be started as it stands (the rehearsal and a fresh apply ask; a plan whose
+/// phase 0 already ran goes on): a role step that takes owner level away without naming
+/// BYPASSRLS. The planner names it since #425 (the roles path removes BYPASSRLS with owner
+/// level unless the change keeps it), so such a plan was computed before and doesn't say what
+/// the merged model has.
+pub(crate) fn outdated(plan: &StoredPlan) -> Option<String> {
+    use chelabase_schema::plan::RoleOp;
+    plan.steps.iter().find_map(|s| match &s.role_op {
+        Some(RoleOp::Update { name, patch })
+            if patch.owner_level == Some(false) && patch.bypass_rls.is_none() =>
+        {
+            Some(format!(
+                "the plan predates naming BYPASSRLS when a role loses owner level (role \
+                 {name}); recompute the merge"
+            ))
+        }
+        _ => None,
+    })
+}
+
 /// The conflicts of the merge's analysis that no stored resolution answers (the API's
 /// `open_conflicts`, M8).
 pub(crate) fn open_conflicts(merge: &MergeRecord) -> Vec<String> {

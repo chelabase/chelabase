@@ -3174,6 +3174,50 @@ async fn taking_owner_level_away_removes_bypassrls_unless_the_change_keeps_it() 
     .await;
 }
 
+// Taking owner level away removes every owner attribute the role has: a role that is
+// owner-level without the whole set (CREATEROLE alone, set in SQL) loses it, and BYPASSRLS
+// unless the change keeps it. A change that doesn't name owner level leaves both.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn taking_owner_level_away_removes_every_owner_attribute_the_role_has() {
+    live(|fx| async move {
+        let at = |role: &str| {
+            format!(
+                "SELECT rolcreaterole::text || ',' || rolbypassrls::text || ',' || \
+                 rolconnlimit::text FROM pg_roles WHERE rolname = '{role}';"
+            )
+        };
+        for (role, keep, bypass) in [("dropped", None, false), ("kept", Some(true), true)] {
+            fx.create(fx.main, role, false).await;
+            fx.sql(&format!("ALTER ROLE {role} CREATEROLE BYPASSRLS;")).await;
+            fx.worker.resync(fx.main).await.unwrap();
+            let limit = RolePatch {
+                connection_limit: Some(4),
+                ..RolePatch::default()
+            };
+            assert_eq!(fx.worker.update_role(fx.main, role, &limit).await, RoleOutcome::Ok, "{role}");
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, "true,true,4", "{role}");
+            let patch = RolePatch {
+                owner_level: Some(false),
+                bypass_rls: keep,
+                ..RolePatch::default()
+            };
+
+            assert_eq!(fx.worker.update_role(fx.main, role, &patch).await, RoleOutcome::Ok, "{role}");
+
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},4"), "{role}");
+            fx.worker.resync(fx.main).await.unwrap();
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},4"), "{role}");
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let row = rows.iter().find(|r| r.name == role).unwrap();
+            assert_eq!(row.level, RoleLevel::Plain, "{role}");
+            assert_eq!(row.attributes.bypass_rls, bypass, "{role}");
+            assert!(!row.attributes_pending, "{role}");
+        }
+    })
+    .await;
+}
+
 // #425: a PATCH stored but not applied yet (a failed script, or a confirm lost to a
 // concurrent write) that changed only the connection limit, then the role expired in SQL
 // (`VALID UNTIL '-infinity'`): the resync applies the limit and records the SQL expiry,

@@ -828,14 +828,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(refused)?;
         }
-        let attributes = patch.apply(o.owner_attributes, &o.attributes());
+        let attributes = patch.apply(o.owner_level, &o.attributes());
         let wanted = WantedRole {
             name,
             owner_level: patch.owner_level.unwrap_or(o.owner_attributes),
             login: o.login,
             attributes: &attributes,
         };
-        let statements = update_statements(&wanted, &o, None, &patch);
+        let statements =
+            update_statements(&wanted, &o, None, &patch, patch.owner_level == Some(false));
         if statements.is_empty() {
             return Ok(StepOutcome::Skipped);
         }

@@ -22,7 +22,8 @@ pub fn fingerprint(m: &SchemaModel) -> String {
 /// - a role a `RoleOp::Create` makes, and the owner's memberships in it (E22: Postgres's
 ///   automatic grants to the creator);
 /// - the fields a `RoleOp::Update` patches, on that role only (not the whole role: its other
-///   attributes, and the owner's memberships in it, still count);
+///   attributes, and the owner's memberships in it, still count); an owner-level change covers
+///   the `neon_superuser` membership and the owner's attributes that go with it;
 /// - a `RoleOp::Rename` (E29): the role (by its OID) and every reference to it are read under
 ///   the new name;
 /// - the values each phase 1a step adds, on the enum it names (the enum's other values, its
@@ -86,6 +87,10 @@ pub fn precheck_fingerprint(m: &SchemaModel, steps: &[Step]) -> String {
     fingerprint(&projected)
 }
 
+/// The attributes among [`crate::model::Role::other_attributes`] that the roles path sets with
+/// owner level and removes with it (BYPASSRLS, the fourth, is a field of its own).
+const OWNER_LEVEL_ATTRIBUTES: [&str; 3] = ["CREATEDB", "CREATEROLE", "REPLICATION"];
+
 /// `r` with the fields `patch` sets at fixed values (whatever they were).
 fn project_patch(r: &mut crate::model::Role, patch: &crate::plan::RolePatchModel) {
     use crate::model::{OWNER_LEVEL_ROLE, membership_merges};
@@ -106,6 +111,9 @@ fn project_patch(r: &mut crate::model::Role, patch: &crate::plan::RolePatchModel
     }
     if patch.owner_level.is_some() {
         r.member_of.retain(|m| m.role.name != OWNER_LEVEL_ROLE);
+        // Owner level is given and taken away with the owner's attributes.
+        r.other_attributes
+            .retain(|a| !OWNER_LEVEL_ATTRIBUTES.contains(&a.as_str()));
     }
     if patch.member_of.is_some() {
         r.member_of

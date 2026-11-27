@@ -726,8 +726,9 @@ fn retried_reset(row: &RoleCopy) -> bool {
 /// the change named (`attributes_named`) from the row, every other one from `o`, so a change
 /// made in SQL since is kept. `(owner_level, login, attributes)`; owner level is the row's
 /// wanted one or the catalog's owner attributes, memberships (with their options) the row's
-/// or the catalog's. A change that takes owner level away also removes the BYPASSRLS that
-/// came with it, unless it names `bypass_rls` itself.
+/// or the catalog's. A change that takes owner level away from a role the catalog shows
+/// owner-level ([`ObservedRole::owner_level`]) also removes BYPASSRLS, one of the owner's
+/// attributes, unless it names `bypass_rls` itself.
 pub(crate) fn pending_wanted(row: &RoleCopy, o: &ObservedRole) -> (bool, bool, RoleAttributes) {
     let named = |f: RoleField| row.attributes_named.contains(&f);
     let (r, c) = (&row.attributes, o.attributes());
@@ -748,7 +749,7 @@ pub(crate) fn pending_wanted(row: &RoleCopy, o: &ObservedRole) -> (bool, bool, R
         bypass_rls: if named(RoleField::BypassRls) {
             r.bypass_rls
         } else {
-            c.bypass_rls && !(o.owner_attributes && !owner_level)
+            c.bypass_rls && !(owner_level_off(row) && o.owner_level)
         },
         member_of: if members { r.member_of.clone() } else { c.member_of },
         member_no_set: if members { r.member_no_set.clone() } else { c.member_no_set },
@@ -756,6 +757,12 @@ pub(crate) fn pending_wanted(row: &RoleCopy, o: &ObservedRole) -> (bool, bool, R
     };
     let login = if named(RoleField::Login) { row.login } else { o.login };
     (owner_level, login, attributes)
+}
+
+/// Whether `row`'s pending change names owner level off: only such a change takes the owner's
+/// attributes away from a role that hasn't the whole set ([`wanted_statements`]).
+fn owner_level_off(row: &RoleCopy) -> bool {
+    row.attributes_named.contains(&RoleField::OwnerLevel) && !row.api_owner_level
 }
 
 /// One role's SQL statements, run as one script of their own (C1): a failure stops only
@@ -887,7 +894,7 @@ pub fn plan_resync(
                         login,
                         attributes: &attributes,
                     };
-                    for sql in wanted_statements(owner, &wanted, o) {
+                    for sql in wanted_statements(owner, &wanted, o, owner_level_off(row)) {
                         push_repair(&mut repairs, &row.name, sql);
                     }
                     if row.attributes_named.contains(&RoleField::OwnerLevel) {
@@ -1533,14 +1540,21 @@ pub fn attributes_sql(role: &WantedRole<'_>, o: &ObservedRole) -> Option<String>
 /// when wanted on its own), then the memberships as the owner. Empty when they all match. The
 /// roles path's PATCH runs it after its password change; the resync drives an unconfirmed API
 /// change with it (E32).
+///
+/// `owner_level_off`: the change names owner level off. It then takes away every owner
+/// attribute the role has, also from a role that is owner-level without the whole set
+/// (CREATEROLE alone, set in SQL). A change that doesn't name owner level leaves such a role's
+/// attributes alone (they aren't its to change).
 pub(crate) fn wanted_statements(
     owner: &str,
     wanted: &WantedRole<'_>,
     o: &ObservedRole,
+    owner_level_off: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut o = o.clone();
-    let strip = !wanted.owner_level && o.owner_attributes;
+    let strip =
+        !wanted.owner_level && (o.owner_attributes || (owner_level_off && o.owner_level));
     if strip {
         // The strip sets BYPASSRLS as wanted.
         o.bypass_rls = wanted.attributes.bypass_rls;
@@ -1586,7 +1600,8 @@ pub fn memberships_sql(owner: &str, role: &WantedRole<'_>, o: &ObservedRole) -> 
 }
 
 /// Takes the owner's attributes and `neon_superuser` away from a role that stops being
-/// owner-level, as `cloud_admin`; BYPASSRLS stays only when it's wanted on its own.
+/// owner-level, as `cloud_admin`, whichever of them it has; BYPASSRLS stays only when it's
+/// wanted on its own.
 pub fn strip_owner_attributes_sql(name: &str, bypass_rls: bool) -> String {
     let ident = quote_ident(name);
     let bypass = if bypass_rls { "BYPASSRLS" } else { "NOBYPASSRLS" };
@@ -2962,6 +2977,87 @@ mod tests {
             }
         }
         assert_eq!(checked, 128 * 4);
+    }
+
+    // Taking owner level away removes every owner attribute the role has, and only a change
+    // that names owner level off does. Exhaustive over the catalog's role (not owner-level,
+    // owner-level without the whole set of the owner's attributes, or with it) × its
+    // BYPASSRLS × whether the pending change names owner level and BYPASSRLS × their values
+    // in the row. The owner's attributes are taken away exactly when the change names owner
+    // level off and the catalog's role is owner-level; BYPASSRLS then goes too unless the
+    // change names it on. A change that doesn't name owner level leaves all of them.
+    #[test]
+    fn a_pending_change_takes_the_owner_attributes_away_only_when_it_names_owner_level_off() {
+        use chelabase_metadata::RoleField;
+        let mut checked = 0;
+        for (seen_level, seen_owner) in [(false, false), (true, false), (true, true)] {
+            for bits in 0..32_u8 {
+                let [seen_bypass, names_owner, row_owner, names_bypass, row_bypass] =
+                    [1, 2, 4, 8, 16].map(|b| bits & b != 0);
+                if seen_owner && !seen_bypass {
+                    // The whole set includes BYPASSRLS.
+                    continue;
+                }
+                let mut row = copy("r", RoleOrigin::Api, None);
+                row.login = false;
+                row.password_enc = None;
+                row.api_owner_level = row_owner;
+                row.level = level_of(row_owner);
+                row.pending = true;
+                row.attributes_pending = true;
+                row.attributes_named = [
+                    (names_owner, RoleField::OwnerLevel),
+                    (names_bypass, RoleField::BypassRls),
+                ]
+                .into_iter()
+                .filter_map(|(named, f)| named.then_some(f))
+                .collect();
+                row.attributes.bypass_rls = row_bypass;
+                let mut o = role("r", None);
+                o.login = false;
+                o.owner_level = seen_level;
+                o.owner_attributes = seen_owner;
+                o.bypass_rls = seen_bypass;
+                let (repairs, write) =
+                    plan_resync(OWNER_ROLE, std::slice::from_ref(&row), &observed(vec![o.clone()]));
+                let statements = flat(&repairs);
+                let case = format!(
+                    "seen_level={seen_level} seen_owner={seen_owner} seen_bypass={seen_bypass} \
+                     names_owner={names_owner} row_owner={row_owner} names_bypass={names_bypass} \
+                     row_bypass={row_bypass}: {statements:?}"
+                );
+                let named_off = names_owner && !row_owner;
+                let taken = named_off && seen_level;
+                let given = names_owner && row_owner && !seen_owner;
+                let wanted_bypass = if names_bypass { row_bypass } else { seen_bypass && !taken };
+                let strip = |bypass: &str| {
+                    format!(
+                        "ALTER ROLE \"r\" NOCREATEROLE NOCREATEDB NOREPLICATION {bypass};\n\
+                         REVOKE neon_superuser FROM \"r\";"
+                    )
+                };
+                let want: Vec<String> = if taken {
+                    vec![strip(if wanted_bypass { "BYPASSRLS" } else { "NOBYPASSRLS" })]
+                } else if given {
+                    vec![owner_attributes_sql("r")]
+                } else if wanted_bypass != seen_bypass && !(names_owner && row_owner) && !(!names_owner && seen_owner) {
+                    let word = if wanted_bypass { "BYPASSRLS" } else { "NOBYPASSRLS" };
+                    vec![format!("ALTER ROLE \"r\" {word};")]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(statements, want, "{case}");
+                let u = upsert(&write, "r").expect("written");
+                assert_eq!(u.attributes.bypass_rls, wanted_bypass, "{case}");
+                if names_owner {
+                    assert_eq!((u.level, u.api_owner_level), (level_of(row_owner), None), "{case}");
+                } else {
+                    assert_eq!((u.level, u.api_owner_level), (level_of(seen_level), Some(seen_owner)), "{case}");
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 32 + 32 + 16);
     }
 
     fn level_of(owner_level: bool) -> RoleLevel {
