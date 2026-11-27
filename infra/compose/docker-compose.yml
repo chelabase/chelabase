@@ -1688,7 +1688,7 @@ services:
   # interfaces by default), and `ulimits`, which that standard doesn't cover.
   # scripts/tests/compose-compute-network-internal.sh checks them. No `default` network.
   compute-egress:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/compute-egress:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:350ab607dc595b6d4d305ca359ba62548775509a863c33e6e3c6776e646e2d53}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/compute-egress:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:84ea0a70576ea32c58eb19116a983f40baebf5ba46565a85c693270d4c040f15}
     profiles: ["compute-egress"]
     restart: unless-stopped
     user: "65532:65532"
