@@ -2621,7 +2621,9 @@ mod fn_triggers {
             let during = verdict(fx, t).await;
             long.await.unwrap().unwrap();
             assert_eq!(yielded, Ok(false), "the sync yields to the tenant's lock");
-            assert_eq!(during, INSTALLED, "settled while its database trigger was still in place");
+            // #301: the run-as change pended it (held, never delivered); not settled `failed`
+            // while its database trigger was still in place.
+            assert_eq!(during, (TriggerState::PendingInstall, None), "settled while its database trigger was still in place");
             assert_eq!(queued(fx, t).await, 1);
             fx.worker.sync_pending_fn_triggers().await;
             assert_eq!(verdict(fx, t).await, failed("run_as_role_required"));
@@ -2632,12 +2634,271 @@ mod fn_triggers {
         .await;
     }
 
+    /// #301: the run-as OID trigger `id`'s database trigger records (its second argument).
+    async fn db_trigger_run_as(fx: &Fx, id: Uuid) -> String {
+        fx.value(fx.main, &format!(
+            "SELECT convert_from(rtrim(substring(tgargs FROM position('\\x00'::bytea IN tgargs) + 1), '\\x00'::bytea), 'UTF8')
+             FROM pg_trigger WHERE tgname = '{}'", trigger_name(id)
+        ))
+        .await
+    }
+
+    /// #301 AC 1: events captured under run-as role A are never delivered once the role is
+    /// changed to B. The change pends the trigger at once (the dispatcher holds a pending
+    /// trigger's events), and the next sync replaces the database trigger with B's, removing
+    /// and counting every event queued before, then captures under B. The same holds when the
+    /// old database trigger was gone by the time of the sync (dropped by the table's owner
+    /// after it queued), so a row that can't be told apart by its trigger still goes.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn a_run_as_change_stops_delivery_of_rows_captured_before() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE TABLE public.items (id int);
+                          CREATE ROLE ra NOLOGIN; CREATE ROLE rb NOLOGIN;
+                          GRANT SELECT ON public.orders, public.items TO ra, rb;").await;
+            let f = fx.function_without_run_as("hello").await;
+            fx.set_run_as(main, f, "ra").await;
+            let kept = fx.trigger(main, f, "orders", &["insert"]).await;
+            let gone = fx.trigger(main, f, "items", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!((verdict(fx, kept).await, verdict(fx, gone).await), (INSTALLED, INSTALLED));
+            let (ra, rb) = (fx.role_oid(main, "ra").await, fx.role_oid(main, "rb").await);
+            assert_eq!(db_trigger_run_as(fx, kept).await, ra.to_string());
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2); INSERT INTO public.items VALUES (1);").await;
+            assert_eq!((queued(fx, kept).await, queued(fx, gone).await), (2, 1));
+            fx.sql(main, &format!("DROP TRIGGER {} ON public.items", trigger_name(gone))).await;
+            fx.set_run_as(main, f, "rb").await;
+            // Held from the change on: the dispatcher delivers only installed triggers.
+            for t in [kept, gone] {
+                assert_eq!(verdict(fx, t).await, (TriggerState::PendingInstall, None));
+            }
+            fx.sql(main, "INSERT INTO public.orders VALUES (3)").await;
+            assert_eq!(queued(fx, kept).await, 3, "still captured under ra until the sync");
+            fx.worker.sync_pending_fn_triggers().await;
+            for (t, n) in [(kept, 3), (gone, 1)] {
+                assert_eq!(verdict(fx, t).await, INSTALLED, "{t}");
+                assert_eq!(queued(fx, t).await, 0, "nothing captured under ra stays: {t}");
+                assert_eq!(trigger_row(fx, t).await.dropped_count, n, "{t}");
+                assert_eq!(db_trigger_run_as(fx, t).await, rb.to_string(), "{t}");
+            }
+            fx.sql(main, "INSERT INTO public.orders VALUES (4); INSERT INTO public.items VALUES (2);").await;
+            assert_eq!((queued(fx, kept).await, queued(fx, gone).await), (1, 1), "captured under rb");
+            // A later sync with no change keeps what rb captured.
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!((queued(fx, kept).await, queued(fx, gone).await), (1, 1));
+        })
+        .await;
+    }
+
+    /// #301 audit R2-1: a role with no rights on the triggered table makes, on a table of its
+    /// own, a trigger under a wanted trigger's name. The sync drops the namesake as before,
+    /// and removes none of the events the real trigger queued (captured under the function's
+    /// current run-as role, which didn't change): a namesake on another table is no previous
+    /// form of the trigger.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn a_namesake_trigger_on_another_table_drops_no_events() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE ROLE ra NOLOGIN; GRANT SELECT ON public.orders TO ra;
+                          CREATE ROLE squatter NOLOGIN; CREATE SCHEMA sq AUTHORIZATION squatter;").await;
+            let f = fx.function_without_run_as("hello").await;
+            fx.set_run_as(main, f, "ra").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(verdict(fx, t).await, INSTALLED);
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2)").await;
+            assert_eq!(queued(fx, t).await, 2);
+            fx.sql(main, &format!(
+                "SET ROLE squatter; CREATE TABLE sq.mine (id int);
+                 CREATE TRIGGER {} BEFORE UPDATE ON sq.mine FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger();
+                 RESET ROLE;", trigger_name(t)
+            )).await;
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!(verdict(fx, t).await, INSTALLED);
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]), "the namesake is dropped");
+            assert_eq!((queued(fx, t).await, trigger_row(fx, t).await.dropped_count), (2, 0), "no event is dropped");
+        })
+        .await;
+    }
+
+    /// #301 AC 1 (cleared): clearing the run-as role pends the trigger at once, and the next
+    /// sync drops its database trigger, removes and counts its queued events and settles it
+    /// `run_as_role_required`.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn clearing_run_as_settles_its_triggers() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE ROLE ra NOLOGIN; GRANT SELECT ON public.orders TO ra;").await;
+            let f = fx.function_without_run_as("hello").await;
+            fx.set_run_as(main, f, "ra").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            fx.sql(main, "INSERT INTO public.orders VALUES (1), (2)").await;
+            assert_eq!(queued(fx, t).await, 2);
+            assert!(fx.metadata.set_run_as(main, f, None).await.unwrap());
+            assert_eq!(verdict(fx, t).await, (TriggerState::PendingInstall, None), "held at once");
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!(verdict(fx, t).await, failed("run_as_role_required"));
+            assert_eq!(fx.db_triggers(main).await, "");
+            assert_eq!(queued(fx, t).await, 0);
+            assert_eq!(trigger_row(fx, t).await.dropped_count, 2);
+        })
+        .await;
+    }
+
+    /// #301 AC 2: a trigger settled `failed` because its run-as role couldn't read the table
+    /// is checked again when the run-as role changes: set to a role that can, the next sweep
+    /// installs it.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn a_failed_trigger_is_retried_after_a_run_as_change() {
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE TABLE public.orders (id int); CREATE ROLE nogrant NOLOGIN; CREATE ROLE reader NOLOGIN;
+                          GRANT SELECT ON public.orders TO reader;").await;
+            let f = fx.function_without_run_as("hello").await;
+            fx.set_run_as(main, f, "nogrant").await;
+            let t = fx.trigger(main, f, "orders", &["insert"]).await;
+            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+            assert_eq!(verdict(fx, t).await, failed(CANNOT_READ));
+            fx.set_run_as(main, f, "reader").await;
+            fx.worker.sync_pending_fn_triggers().await;
+            assert_eq!(verdict(fx, t).await, INSTALLED);
+            assert_eq!(trigger_names(&fx.db_triggers(main).await), names(&[t]));
+            fx.sql(main, "INSERT INTO public.orders VALUES (1)").await;
+            assert_eq!(queued(fx, t).await, 1);
+        })
+        .await;
+    }
+
+    /// #301: the database trigger's run-as OID for trigger `id` now (`None`: no database
+    /// trigger), then `INSERT INTO public.<table> VALUES (<row>)`: what the event was captured
+    /// under.
+    async fn capture(fx: &Fx, table: &str, id: Uuid, row: i64) -> Option<i64> {
+        let oid = db_trigger_run_as(fx, id).await.parse().ok();
+        fx.sql(fx.main, &format!("INSERT INTO public.{table} VALUES ({row})")).await;
+        oid
+    }
+
+    /// #301: the rows of trigger `id`'s queued events, in queue order.
+    async fn queued_rows(fx: &Fx, id: Uuid) -> Vec<i64> {
+        fx.value(fx.main, &format!(
+            "SELECT coalesce(string_agg(payload->'record'->>'id', ',' ORDER BY id), '')
+             FROM chelabase_functions.outbox WHERE trigger_id = '{id}'"
+        ))
+        .await
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap())
+        .collect()
+    }
+
+    /// #301 (audit S1, B1): the invariant "an `installed` table trigger's outbox holds only
+    /// events captured under its function's current run-as OID", exhaustively over where a
+    /// run-as change lands in one sync pass (before it, between its two metadata reads, or
+    /// after its scripts and before its settle), what it changes to (the same role, another
+    /// role that can read, one that can't, cleared) and the row's state when it lands
+    /// (`installed`, or already pending after an earlier change). Each event is tagged with
+    /// the run-as OID its database trigger recorded when it was captured. After two more
+    /// passes the row is settled for the final role (installed, or failed with the right
+    /// reason with nothing queued), and an event captured under that role then is queued.
+    #[tokio::test]
+    #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+    async fn run_as_change_at_any_point_of_a_sync_keeps_the_invariant() {
+        use worker::fn_triggers::SyncPoint;
+        with_fx(|fx| async move {
+            let main = fx.main;
+            fx.sql(main, "CREATE ROLE ra NOLOGIN; CREATE ROLE rb NOLOGIN; CREATE ROLE rn NOLOGIN;").await;
+            let mut oid = std::collections::HashMap::new();
+            for role in ["ra", "rb", "rn"] {
+                oid.insert(role, fx.role_oid(main, role).await);
+            }
+            let points = [None, Some(SyncPoint::AfterTriggersRead), Some(SyncPoint::BeforeSettle)];
+            let changes = [Some("ra"), Some("rb"), Some("rn"), None];
+            let mut failures = Vec::new();
+            let mut i = 0;
+            for pending in [false, true] {
+                for point in points {
+                    for change in changes {
+                        i += 1;
+                        let case = format!("pending {pending}, at {point:?}, to {change:?}");
+                        let table = format!("ilv_{i}");
+                        fx.sql(main, &format!("CREATE TABLE public.{table} (id int); GRANT SELECT ON public.{table} TO ra, rb;")).await;
+                        let f = fx.function_without_run_as(&format!("ilv-{i}")).await;
+                        fx.set_run_as(main, f, "ra").await;
+                        let t = fx.trigger(main, f, &table, &["insert"]).await;
+                        fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                        assert_eq!(verdict(fx, t).await, INSTALLED, "{case}");
+                        let mut tags = std::collections::HashMap::new();
+                        tags.insert(1, capture(fx, &table, t, 1).await);
+                        if pending {
+                            fx.set_run_as(main, f, "rb").await;
+                            tags.insert(2, capture(fx, &table, t, 2).await);
+                        }
+                        let apply = move || async move {
+                            match change {
+                                Some(role) => fx.set_run_as(main, f, role).await,
+                                None => assert!(fx.metadata.set_run_as(main, f, None).await.unwrap()),
+                            }
+                        };
+                        match point {
+                            None => {
+                                apply().await;
+                                fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                            }
+                            Some(at) => {
+                                let hook = move |p: SyncPoint| -> futures_util::future::BoxFuture<'static, ()> {
+                                    Box::pin(async move {
+                                        if p == at {
+                                            apply().await;
+                                        }
+                                    })
+                                };
+                                fx.worker.sync_fn_triggers_at(main, false, &hook).await.unwrap();
+                            }
+                        }
+                        tags.insert(3, capture(fx, &table, t, 3).await);
+                        for _ in 0..2 {
+                            fx.worker.sync_fn_triggers(main, false).await.unwrap();
+                        }
+                        tags.insert(4, capture(fx, &table, t, 4).await);
+                        let (state, error) = verdict(fx, t).await;
+                        let queued = queued_rows(fx, t).await;
+                        let current = change.filter(|r| *r != "rn").map(|r| oid[r]);
+                        let expected = match change {
+                            Some("rn") => failed(CANNOT_READ),
+                            None => failed("run_as_role_required"),
+                            _ => INSTALLED,
+                        };
+                        if (state, error.clone()) != expected {
+                            failures.push(format!("{case}: settled {state:?} {error:?}, expected {expected:?}"));
+                        }
+                        let foreign: Vec<i64> = queued.iter().copied().filter(|r| tags[r] != current || current.is_none()).collect();
+                        if !foreign.is_empty() {
+                            failures.push(format!("{case}: {state:?} with events captured under another role queued: {foreign:?} (tags {tags:?})"));
+                        }
+                        if state == TriggerState::Installed && !queued.contains(&4) {
+                            failures.push(format!("{case}: installed but the event captured after the passes isn't queued: {queued:?}"));
+                        }
+                    }
+                }
+            }
+            assert!(failures.is_empty(), "{failures:#?}");
+        })
+        .await;
+    }
+
     /// m17: the read rule ([`run_as_reads`]) checked exhaustively against Postgres itself.
     /// For every combination of a role's grant (none, a column, the table, through an
-    /// inherited or a NOINHERIT membership), its BYPASSRLS (none, its own, a group's), the
-    /// table's owner (another role, the role, a group it inherits or doesn't) and the table's
-    /// RLS (off, enabled, forced; no policies, so RLS hides every row) and the role's USAGE on
-    /// the table's schema (granted, or not, m17 fix 1), the rule's
+    /// inherited or a NOINHERIT membership, membership in `pg_read_all_data`), its attributes
+    /// (plain, its own BYPASSRLS, a group's BYPASSRLS, SUPERUSER, NOINHERIT), the table's owner
+    /// (another role, the role, a group it inherits or doesn't) and the table's RLS (off,
+    /// enabled, forced, each without policies so RLS hides every row; or enabled with a
+    /// permissive policy passing one of the two rows) and the role's USAGE on the table's
+    /// schema (granted, or not, m17 fix 1), the rule's
     /// `can_select` part equals "a `SELECT` of every column as the role is permitted" and the
     /// whole rule equals "that `SELECT` as the role sees every row". The probe reads the whole
     /// row (`count(t.*)`) of a two-column table, so a column grant isn't all columns. The
@@ -2649,10 +2910,13 @@ mod fn_triggers {
     async fn run_as_rule_model_agrees_with_postgres() {
         with_fx(|fx| async move {
             let main = fx.main;
-            let grants = ["none", "column", "table", "group", "noinherit_group"];
-            let bypasses = ["none", "own", "group"];
+            // #301: plus a member of `pg_read_all_data`, a superuser, a role with the
+            // NOINHERIT attribute (its "group" memberships take the attribute's default) and a
+            // table with a permissive policy that passes one of its two rows.
+            let grants = ["none", "column", "table", "group", "noinherit_group", "read_all_data"];
+            let bypasses = ["none", "own", "group", "superuser", "noinherit"];
             let owners = ["other", "self", "group", "noinherit_group"];
-            let rls = ["off", "on", "forced"];
+            let rls = ["off", "on", "forced", "policy"];
             let usages = ["usage", "no_usage"];
             let mut setup = String::from(
                 "CREATE ROLE m_sel NOLOGIN; CREATE ROLE m_own NOLOGIN; CREATE ROLE m_bypass NOLOGIN BYPASSRLS; CREATE ROLE m_other NOLOGIN;\n",
@@ -2665,16 +2929,20 @@ mod fn_triggers {
                             for u in usages {
                                 let i = cases.len();
                                 let (role, table) = (format!("m_r{i}"), format!("m_s{i}.m_t{i}"));
-                                setup.push_str(&format!("CREATE ROLE {role} NOLOGIN{}; CREATE SCHEMA m_s{i}; CREATE TABLE {table} (id int, note text); INSERT INTO {table} VALUES (1, 'a');\n",
-                                    if b == "own" { " BYPASSRLS" } else { "" }));
+                                setup.push_str(&format!("CREATE ROLE {role} NOLOGIN{}; CREATE SCHEMA m_s{i}; CREATE TABLE {table} (id int, note text); INSERT INTO {table} VALUES (1, 'a'), (2, 'b');\n",
+                                    match b { "own" => " BYPASSRLS", "superuser" => " SUPERUSER", "noinherit" => " NOINHERIT", _ => "" }));
+                                // A NOINHERIT role's "group" memberships are granted without an
+                                // INHERIT option, so the role attribute decides.
+                                let inherit = if b == "noinherit" { "" } else { " WITH INHERIT TRUE" };
                                 if u == "usage" {
                                     setup.push_str(&format!("GRANT USAGE ON SCHEMA m_s{i} TO {role};\n"));
                                 }
                                 setup.push_str(&match g {
                                     "column" => format!("GRANT SELECT (id) ON {table} TO {role};\n"),
                                     "table" => format!("GRANT SELECT ON {table} TO {role};\n"),
-                                    "group" => format!("GRANT SELECT ON {table} TO m_sel; GRANT m_sel TO {role} WITH INHERIT TRUE;\n"),
+                                    "group" => format!("GRANT SELECT ON {table} TO m_sel; GRANT m_sel TO {role}{inherit};\n"),
                                     "noinherit_group" => format!("GRANT SELECT ON {table} TO m_sel; GRANT m_sel TO {role} WITH INHERIT FALSE;\n"),
+                                    "read_all_data" => format!("GRANT pg_read_all_data TO {role}{inherit};\n"),
                                     _ => String::new(),
                                 });
                                 if b == "group" {
@@ -2682,22 +2950,29 @@ mod fn_triggers {
                                 }
                                 setup.push_str(&match o {
                                     "self" => format!("ALTER TABLE {table} OWNER TO {role};\n"),
-                                    "group" => format!("ALTER TABLE {table} OWNER TO m_own; GRANT m_own TO {role} WITH INHERIT TRUE;\n"),
+                                    "group" => format!("ALTER TABLE {table} OWNER TO m_own; GRANT m_own TO {role}{inherit};\n"),
                                     "noinherit_group" => format!("ALTER TABLE {table} OWNER TO m_own; GRANT m_own TO {role} WITH INHERIT FALSE;\n"),
                                     _ => format!("ALTER TABLE {table} OWNER TO m_other;\n"),
                                 });
                                 match r {
                                     "on" => setup.push_str(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;\n")),
                                     "forced" => setup.push_str(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY;\n")),
+                                    "policy" => setup.push_str(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY; CREATE POLICY m_p ON {table} USING (id = 1);\n")),
                                     _ => {}
                                 }
                                 cases.push(format!("{g}/{b}/{o}/{r}/{u}"));
+                                // In batches, so no one statement list runs into psql's timeout.
+                                if cases.len() % 120 == 0 {
+                                    fx.sql(main, &std::mem::take(&mut setup)).await;
+                                }
                             }
                         }
                     }
                 }
             }
-            fx.sql(main, &setup).await;
+            if !setup.is_empty() {
+                fx.sql(main, &setup).await;
+            }
             let can_select = worker::fn_triggers::run_as_can_select("r.oid", "c");
             let reads = worker::fn_triggers::run_as_reads("r.oid", "c");
             // Postgres's own answer: the SELECT as the role is denied (-1), or how many rows it sees.
@@ -2728,13 +3003,14 @@ mod fn_triggers {
                 let parts: Vec<&str> = row.split(':').collect();
                 let (n, sel, all): (i64, bool, bool) = (parts[1].parse().unwrap(), parts[2] == "true", parts[3] == "true");
                 seen_kinds.insert(n);
-                if sel != (n >= 0) || all != (n == 1) {
+                if sel != (n >= 0) || all != (n == 2) {
                     mismatches.push(format!("{case}: postgres {n}, can_select {sel}, reads {all}"));
                 }
             }
             assert!(mismatches.is_empty(), "{mismatches:#?}");
-            // The model's assumptions: every outcome happens (denied, hidden by RLS, all rows).
-            assert_eq!(seen_kinds, [-1, 0, 1].into_iter().collect(), "{out}");
+            // The model's assumptions: every outcome happens (denied, every row hidden by RLS,
+            // one row passed by the policy, all rows).
+            assert_eq!(seen_kinds, [-1, 0, 1, 2].into_iter().collect(), "{out}");
             // A role OID that names no role: false, no error.
             let ghost = fx.value(main, &format!(
                 "SELECT ({}) FROM pg_catalog.pg_class c WHERE c.oid = 'm_s0.m_t0'::regclass",
