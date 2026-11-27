@@ -79,13 +79,16 @@ check "build.sh no longer builds vm-compute" refuses 2 "$here/build.sh" vm-compu
 
 # --- Compose ------------------------------------------------------------------------------
 # The base file, the workbench overlay, the self-hosted build overlay and the example's overlay,
-# one project (`chelabase`).
+# one project (`chelabase`). fixtures/stub-service.yml is the functions e2e's test-only stub
+# (`just functions-services-e2e`), not a stack overlay: it is listed by its exact path so any
+# other new Compose file still fails this check.
 compose_file="$root/infra/compose/docker-compose.yml"
 overlay_file="$root/infra/compose/docker-compose.workbench.yml"
 build_file="$root/infra/compose/docker-compose.build.yml"
 example_file="$root/infra/compose/docker-compose.example.yml"
+stub_fixture="$root/infra/compose/fixtures/stub-service.yml"
 check "the base Compose file and its three overlays" \
-  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$build_file $example_file $overlay_file $compose_file "
+  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml ! -path "$stub_fixture" | sort | tr '\n' ' ')" = "$build_file $example_file $overlay_file $compose_file "
 check "no hook-relay image or service left" \
   bash -c '! test -e "$1/infra/compose/hook-relay.Dockerfile" && ! grep -q "hook-relay" "$2"' _ "$root" "$compose_file"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \
@@ -99,7 +102,7 @@ if command -v docker >/dev/null; then
   compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x -f "$compose_file" -f "$overlay_file" --env-file "$fixture")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "the stack has every service (infra, app tier, no hook relay)" \
-    test "$(services)" = "auth create-bucket gateway identity mailpit metadata-db nats orchestrator pageserver proxy proxy-tls realtime register-safekeepers rest safekeeper1 safekeeper2 safekeeper3 seaweedfs storage-broker storage-controller storcon-db studio valkey worker "
+    test "$(services)" = "auth create-bucket functions functions-runtime gateway identity mailpit metadata-db nats orchestrator pageserver proxy proxy-tls realtime register-safekeepers rest safekeeper1 safekeeper2 safekeeper3 seaweedfs storage storage-broker storage-controller storcon-db studio valkey worker "
   check "the project name comes from -p" \
     test "$("${compose[@]}" config --format json | jq -r '.name')" = "chelabase-feat-x"
   check "the compose file names no project" bash -c '! grep -qE "^name:" "$1"' _ "$compose_file"
