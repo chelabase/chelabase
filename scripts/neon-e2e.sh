@@ -4,8 +4,10 @@
 # - psql, SQL over HTTP and the serverless driver answer through Neon's proxy;
 # - each of those sessions reaches the compute over TLS (pg_stat_ssl), and a side proxy trusting
 #   another CA is refused at the compute (needs a proxy recreated with compute-hop-tls), and a
-#   plaintext route cached from a pre-upgrade orchestrator (server_name null) expires to TLS;
-# - a wrong password is refused, and query cancel works;
+#   wake_compute answer without a server_name (a pre-upgrade orchestrator) is refused, never a
+#   plaintext hop (#247), while the real answers log in over TLS;
+# - a wrong password is refused, and query cancel works (on the Postgres port, and on /sql when the
+#   HTTP client disconnects);
 # - a password reset takes effect at once (the old password is refused, on the Postgres port and /sql);
 # - deleting the database removes the compute and the storage-controller tenant.
 # KEEP=1 leaves the database in place on failure.
@@ -241,14 +243,12 @@ for i in $(seq 20); do
 done
 pass "a proxy trusting another CA can't log in (the compute's certificate is refused, no plaintext fallback)"
 
-# An upgrade can't leave a plaintext hop for good (the #224 audit, B1). An orchestrator from
-# before compute-hop-tls answers wake_compute with server_name null, and the proxy caches that
-# compute as plaintext. Compose starts the proxy only after a healthy orchestrator, and the
-# node-info cache has an absolute ttl (10m in the compose file), so the entry is dropped even
-# for an endpoint in constant use. Here a relay in front of the orchestrator plays the old one
-# (server_name null) and then the new one (its real answers), and a side proxy with a 5 s ttl
-# must switch to TLS soon after. (The compute takes plaintext from the proxy today, so the old
-# answer logs in with ssl = f; see the compute-spec follow-up.)
+# No plaintext hop, even from an orchestrator that names no certificate (#247). An orchestrator
+# from before compute-hop-tls answers wake_compute with server_name null; the proxy refuses that
+# answer (fails closed, with a log line) instead of connecting without TLS. Here a relay in front
+# of the orchestrator plays the old one (server_name null) and then the new one (its real
+# answers): a side proxy behind it refuses the login while the answer has no name, and logs in
+# over TLS once the answers carry it (a 5 s node-info ttl, so nothing stale is kept).
 echo old >"$tmp/relay-mode"
 : >"$tmp/relay-log"
 # shellcheck disable=SC2016 # JavaScript, not shell.
@@ -304,22 +304,26 @@ upg="neon-e2e-upgrade-$suffix"
 side_proxies+=("$upg")
 upg_ip="$(side_proxy "$upg" "$compute_ca_pem" "--auth-endpoint=http://$relay/proxy/api/v1" \
   "--wake-compute-cache=size=4000,idle_ttl=4m,ttl=5s")"
-got="$(side_sql "$upg_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")" ||
-  die "a side proxy behind a pre-upgrade orchestrator could not log in: $(cat "$tmp/err")"
-grep -qx old "$tmp/relay-log" || die "the side proxy never asked the relay for the compute (wake_compute)"
-[[ "$got" == f ]] || die "a server_name null answer didn't give a plaintext hop (ssl = '$got'): the relay doesn't play the old orchestrator"
+if got="$(side_sql "$upg_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")"; then
+  die "a side proxy logged in on a wake_compute answer without server_name (ssl = '$got')"
+fi
+grep -qx old "$tmp/relay-log" || die "the side proxy never asked the relay for the compute (wake_compute): $(cat "$tmp/err")"
+docker logs "$upg" 2>&1 | grep -q 'without server_name: refusing to connect to the compute without TLS' ||
+  die "the side proxy refused the login but didn't log the missing server_name: $(cat "$tmp/err")"
+pass "a wake_compute answer without server_name is refused (logged), no plaintext hop"
 echo new >"$tmp/relay-mode"
 started=$SECONDS
 got=""
 for i in $(seq 30); do
-  got="$(side_sql "$upg_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")" ||
-    die "a side proxy after the orchestrator upgrade could not log in: $(cat "$tmp/err")"
+  # A refusal the proxy still holds from the nameless answer may come back first: retry.
+  got="$(side_sql "$upg_ip" -c 'SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()' 2>"$tmp/err")" || got=""
+  [[ -z "$got" || "$got" == t ]] || die "a side proxy after the orchestrator upgrade reached the compute without TLS (ssl = '$got')"
   [[ "$got" == t ]] && break
-  [[ $i -lt 30 ]] || die "the plaintext hop outlived the orchestrator upgrade by $((SECONDS - started)) s with a 5 s cache ttl"
+  [[ $i -lt 30 ]] || die "a side proxy still can't log in $((SECONDS - started)) s after the answers name the compute (5 s cache ttl): $(cat "$tmp/err")"
   sleep 1
 done
 grep -qx new "$tmp/relay-log" || die "the side proxy reached the compute over TLS without asking the upgraded orchestrator"
-pass "a plaintext hop cached from a pre-upgrade orchestrator switches to TLS within the cache ttl ($((SECONDS - started)) s, ttl 5 s)"
+pass "the same side proxy logs in over TLS once the answers name the compute ($((SECONDS - started)) s, ttl 5 s)"
 side_cleanup
 side_proxies=()
 relay_pid=""
@@ -338,6 +342,32 @@ PGPASSWORD="$old" timeout -s INT 2 psql \
 [[ $((SECONDS - started)) -lt 10 ]] || die "cancel took $((SECONDS - started)) s"
 grep -q 'canceling statement due to user request' "$tmp/err" || die "query cancel: $(cat "$tmp/err")"
 pass "query cancel works through the proxy"
+
+# A /sql query is cancelled on the compute when its HTTP client goes away (#247: the proxy sends
+# that cancel over TLS, with a time limit). A long query is seen running, its client disconnects,
+# and the backend leaves it well before it would have ended.
+marker="sqlcancel_$(hex 4)"
+http_running() {
+  sql "$old" -c "SELECT count(*) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND state = 'active' AND query LIKE '%$marker%'"
+}
+curl -sS --max-time 6 --cacert "$ca" --connect-to "$host:$PROXY_HTTP_PORT:$PROXY_HOSTADDR:$PROXY_HTTP_PORT" -o /dev/null -X POST "$http_url" \
+  -H "Neon-Connection-String: postgresql://postgres:$old@$host/$dbname" -H 'content-type: application/json' \
+  -d "$(jq -nc --arg q "SELECT pg_sleep(60) AS $marker" '{query: $q, params: []}')" >/dev/null 2>&1 &
+curl_pid=$!
+seen=""
+for i in $(seq 20); do
+  [[ "$(http_running 2>/dev/null)" == 1 ]] && { seen=1; break; }
+  sleep 0.25
+done
+[[ -n "$seen" ]] || die "the /sql query never showed up as running on the compute"
+wait "$curl_pid" || true
+started=$SECONDS
+for i in $(seq 40); do
+  [[ "$(http_running 2>"$tmp/err")" == 0 ]] && break
+  [[ $i -lt 40 ]] || die "the /sql query still runs $((SECONDS - started)) s after its client disconnected: $(cat "$tmp/err")"
+  sleep 0.5
+done
+pass "a /sql query is cancelled on the compute when its client disconnects ($((SECONDS - started)) s after)"
 
 # 5. A password reset works at once. The proxy has the old secret cached from the connects
 # above: only the worker's /password_updated publish can make it refuse the old password.
