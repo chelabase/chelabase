@@ -27,6 +27,7 @@ use chelabase_metadata::{
     BranchStatus, CreateBranchOutcome, DEMO_PROJECT_ID, DEMO_TENANT_ID, DatabaseStatus,
     MetadataClient, NewBranch, RoleLevel, RoleOrigin,
 };
+use chelabase_metadata::{ApiRoleChange, RoleAttributes, RoleField, SecretChange};
 use chelabase_nats::{BranchJob, PointInTime};
 use chelabase_neon::ComputeBackend;
 use chelabase_secrets::{Purpose, open_credential, open_role_password};
@@ -3132,6 +3133,127 @@ async fn a_negative_infinity_valid_until_is_recorded_as_expired() {
             assert_eq!(app.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "{until} after the PATCH");
             fx.sql("ALTER ROLE app CONNECTION LIMIT -1;").await;
         }
+    })
+    .await;
+}
+
+// Taking owner level away also removes BYPASSRLS, which came with it, unless the change keeps
+// it (`bypass_rls: true`); a resync afterwards records what the compute has.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn taking_owner_level_away_removes_bypassrls_unless_the_change_keeps_it() {
+    live(|fx| async move {
+        let at = |role: &str| {
+            format!(
+                "SELECT rolcreaterole::text || ',' || rolbypassrls::text || ',' || \
+                 pg_has_role('{role}', 'neon_superuser', 'MEMBER')::text \
+                 FROM pg_roles WHERE rolname = '{role}';"
+            )
+        };
+        for (role, keep, bypass) in [("dropped", None, false), ("kept", Some(true), true)] {
+            fx.create(fx.main, role, true).await;
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, "true,true,true", "{role}");
+            let patch = RolePatch {
+                owner_level: Some(false),
+                bypass_rls: keep,
+                ..RolePatch::default()
+            };
+
+            assert_eq!(fx.worker.update_role(fx.main, role, &patch).await, RoleOutcome::Ok, "{role}");
+
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},false"), "{role}");
+            fx.worker.resync(fx.main).await.unwrap();
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},false"), "{role}");
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let row = rows.iter().find(|r| r.name == role).unwrap();
+            assert!(!row.api_owner_level, "{role}");
+            assert_eq!(row.attributes.bypass_rls, bypass, "{role}");
+            assert!(!row.attributes_pending, "{role}");
+        }
+    })
+    .await;
+}
+
+// Taking owner level away removes every owner attribute the role has: a role that is
+// owner-level without the whole set (CREATEROLE alone, set in SQL) loses it, and BYPASSRLS
+// unless the change keeps it. A change that doesn't name owner level leaves both.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn taking_owner_level_away_removes_every_owner_attribute_the_role_has() {
+    live(|fx| async move {
+        let at = |role: &str| {
+            format!(
+                "SELECT rolcreaterole::text || ',' || rolbypassrls::text || ',' || \
+                 rolconnlimit::text FROM pg_roles WHERE rolname = '{role}';"
+            )
+        };
+        for (role, keep, bypass) in [("dropped", None, false), ("kept", Some(true), true)] {
+            fx.create(fx.main, role, false).await;
+            fx.sql(&format!("ALTER ROLE {role} CREATEROLE BYPASSRLS;")).await;
+            fx.worker.resync(fx.main).await.unwrap();
+            let limit = RolePatch {
+                connection_limit: Some(4),
+                ..RolePatch::default()
+            };
+            assert_eq!(fx.worker.update_role(fx.main, role, &limit).await, RoleOutcome::Ok, "{role}");
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, "true,true,4", "{role}");
+            let patch = RolePatch {
+                owner_level: Some(false),
+                bypass_rls: keep,
+                ..RolePatch::default()
+            };
+
+            assert_eq!(fx.worker.update_role(fx.main, role, &patch).await, RoleOutcome::Ok, "{role}");
+
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},4"), "{role}");
+            fx.worker.resync(fx.main).await.unwrap();
+            assert_eq!(fx.value(&fx.ep, &at(role)).await, format!("false,{bypass},4"), "{role}");
+            let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+            let row = rows.iter().find(|r| r.name == role).unwrap();
+            assert_eq!(row.level, RoleLevel::Plain, "{role}");
+            assert_eq!(row.attributes.bypass_rls, bypass, "{role}");
+            assert!(!row.attributes_pending, "{role}");
+        }
+    })
+    .await;
+}
+
+// #425: a PATCH stored but not applied yet (a failed script, or a confirm lost to a
+// concurrent write) that changed only the connection limit, then the role expired in SQL
+// (`VALID UNTIL '-infinity'`): the resync applies the limit and records the SQL expiry,
+// never setting the expiry the row still holds ("no expiry") back.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_pending_patch_leaves_an_expiry_set_in_sql_since() {
+    live(|fx| async move {
+        fx.create(fx.main, "app", false).await;
+        let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let app = rows.iter().find(|r| r.name == "app").unwrap().clone();
+        assert!(!app.attributes_pending);
+        assert_eq!(app.attributes.valid_until, None);
+        let change = ApiRoleChange {
+            owner_level: app.api_owner_level,
+            login: app.login,
+            attributes: RoleAttributes { connection_limit: 4, ..app.attributes.clone() },
+            secret: SecretChange::Keep,
+            change_id: uuid::Uuid::new_v4(),
+            named: [RoleField::ConnectionLimit].into(),
+        };
+        fx.metadata.update_api_role(&fx.ep, "app", &change, 50).await.unwrap();
+        fx.sql("ALTER ROLE app VALID UNTIL '-infinity';").await;
+        let at = "SELECT rolvaliduntil::text || ',' || rolconnlimit::text FROM pg_roles WHERE rolname = 'app';";
+        let set = fx.value(&fx.ep, at).await;
+        assert!(set.ends_with(",-1"), "{set}");
+
+        fx.worker.resync(fx.main).await.unwrap();
+
+        let until = set.trim_end_matches(",-1");
+        assert_eq!(fx.value(&fx.ep, at).await, format!("{until},4"), "the limit applied, the expiry left");
+        let (rows, _) = fx.metadata.role_copies(&fx.ep).await.unwrap();
+        let app = rows.iter().find(|r| r.name == "app").unwrap();
+        assert!(!app.attributes_pending, "applied");
+        assert_eq!(app.attributes.connection_limit, 4);
+        assert_eq!(app.attributes.valid_until, Some(Timestamp::PG_ROUND_TRIP_MIN), "the SQL expiry recorded");
     })
     .await;
 }

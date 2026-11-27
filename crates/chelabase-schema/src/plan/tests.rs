@@ -2525,3 +2525,75 @@ fn abandon_lists_a_not_valid_constraint_only_once_it_exists() {
         ])
     );
 }
+
+// #425: a role diff that takes owner level away always names BYPASSRLS, as the merged model
+// has it, so the plan's text says which and the roles path never decides it. Over every
+// BYPASSRLS on both sides: the patch, the SQL shown, the acknowledgement; and with the role as
+// phase 0 leaves it (owner level and the owner's attributes gone, BYPASSRLS as the patch
+// says), the apply's pre-check reads no change of the target and the drift check none from
+// the merged model.
+#[test]
+fn a_role_diff_that_takes_owner_level_away_names_bypassrls() {
+    for target_bypass in [false, true] {
+        for merged_bypass in [false, true] {
+            let case = format!("target={target_bypass} merged={merged_bypass}");
+            let mut target = model(vec![]);
+            let mut t = role(700, "app");
+            t.bypass_rls = target_bypass;
+            t.member_of = vec![membership(16399, OWNER_LEVEL_ROLE)];
+            t.other_attributes = vec!["CREATEDB".into(), "CREATEROLE".into(), "REPLICATION".into()];
+            target.roles = vec![t];
+            let mut m = model(vec![]);
+            let mut app = role(700, "app");
+            app.bypass_rls = merged_bypass;
+            // As the merge keeps them (`analysis::merge`): the target's, never merged.
+            app.other_attributes = target.roles[0].other_attributes.clone();
+            m.roles = vec![app];
+
+            let p = plan_of(&target, &m);
+
+            assert_eq!(p.steps.len(), 1, "{case}: {:?}", sqls(&p));
+            let step = &p.steps[0];
+            assert_eq!(
+                step.role_op,
+                Some(RoleOp::Update {
+                    name: "app".into(),
+                    patch: RolePatchModel {
+                        owner_level: Some(false),
+                        bypass_rls: Some(merged_bypass),
+                        ..Default::default()
+                    }
+                }),
+                "{case}"
+            );
+            let word = if merged_bypass { "BYPASSRLS" } else { "NOBYPASSRLS" };
+            assert_eq!(
+                step.sql,
+                format!("ALTER ROLE app WITH {word};\nREVOKE neon_superuser FROM app"),
+                "{case}"
+            );
+            assert_eq!(step.security, merged_bypass, "{case}");
+
+            let mut after = target.clone();
+            after.roles[0].member_of.clear();
+            after.roles[0].other_attributes.clear();
+            after.roles[0].bypass_rls = merged_bypass;
+            assert_eq!(
+                crate::fingerprint::precheck_fingerprint(&target, &p.steps),
+                crate::fingerprint::precheck_fingerprint(&after, &p.steps),
+                "{case}: a retry after phase 0 reads the target as changed"
+            );
+            assert_eq!(crate::compare::compare(&m, &after, &[]), Vec::new(), "{case}");
+        }
+    }
+    // Owner level kept or turned on: BYPASSRLS is named only when it differs, as before.
+    let mut target = model(vec![]);
+    let mut t = role(700, "app");
+    t.bypass_rls = true;
+    target.roles = vec![t.clone()];
+    let mut m = model(vec![]);
+    t.member_of = vec![membership(16399, OWNER_LEVEL_ROLE)];
+    m.roles = vec![t];
+    let p = plan_of(&target, &m);
+    assert_eq!(sqls(&p), ["GRANT neon_superuser TO app"]);
+}

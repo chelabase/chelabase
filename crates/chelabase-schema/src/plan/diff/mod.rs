@@ -1277,7 +1277,11 @@ fn role_steps(
                 if !ddl::same_expiry(tr.valid_until.as_deref(), mr.valid_until.as_deref()) {
                     patch.valid_until = Some(mr.valid_until.as_deref().and_then(ddl::rfc3339));
                 }
-                if tr.bypass_rls != mr.bypass_rls {
+                // #425: taking owner level away always says what becomes of BYPASSRLS (the
+                // roles path removes it with owner level unless the change keeps it), so the
+                // role ends as the merged model has it and the plan's text shows which.
+                let loses_owner_level = tr.owner_level() && !mr.owner_level();
+                if tr.bypass_rls != mr.bypass_rls || loses_owner_level {
                     patch.bypass_rls = Some(mr.bypass_rls);
                 }
                 let (tm, mm) = (memberships(tr), memberships(mr));

@@ -32,6 +32,8 @@ export interface UpdateRoleRequest {
   member_of?: string[] | null;
   /**
      * Owner-level on (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, `neon_superuser`) or off.
+     * Turning it off removes every owner attribute the role has, and BYPASSRLS too unless the
+     * same change sets `bypass_rls: true`.
      * @nullable
      */
   owner_level?: boolean | null;

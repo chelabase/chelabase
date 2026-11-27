@@ -1237,6 +1237,70 @@ async fn roles_expired_before_year_one_merge_at_the_floor() {
     .await;
 }
 
+/// #425: a role that lost owner level on the source and kept BYPASSRLS, onto a target where
+/// it's still owner-level. The plan names BYPASSRLS, the step needs an acknowledgement, and
+/// the role ends as the merged schema has it: neither the rehearsal nor the apply reports
+/// drift.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn a_role_that_lost_owner_level_keeps_the_bypassrls_the_merged_schema_has() {
+    live(|fx| async move {
+        fx.owner(fx.main, BASE).await;
+        fx.owner(fx.main, "CREATE ROLE boss NOLOGIN;").await;
+        fx.admin(
+            fx.main,
+            "ALTER ROLE boss CREATEROLE CREATEDB BYPASSRLS REPLICATION; GRANT neon_superuser TO boss;",
+        )
+        .await;
+        let dev = fx.child("dev", fx.main).await;
+        fx.admin(
+            dev,
+            "ALTER ROLE boss NOCREATEROLE NOCREATEDB NOREPLICATION; REVOKE neon_superuser FROM boss;",
+        )
+        .await;
+
+        let m = fx.merge_into_main(dev).await;
+        assert_planned(&m);
+        println!("plan:\n{}", plan_text(&m));
+        let steps = plan_steps(&m);
+        let step = steps
+            .iter()
+            .find(|s| s["sql"].as_str().is_some_and(|q| q.contains("REVOKE neon_superuser FROM boss")))
+            .unwrap_or_else(|| panic!("the role step:\n{}", plan_text(&m)));
+        let sql = step["sql"].as_str().unwrap();
+        assert!(sql.contains("BYPASSRLS") && !sql.contains("NOBYPASSRLS"), "{sql}");
+        assert_eq!(step["security"], json!(true), "{sql}");
+        let items = step["items"].as_array().cloned().unwrap_or_default();
+        let acks = if items.is_empty() { vec![step["id"].clone()] } else { items };
+        let m = fx
+            .save(
+                m.id,
+                MergeDraftPatch {
+                    acknowledgements: Some(Value::Array(acks)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert_planned(&m);
+        let m = fx.rehearse(m.id).await;
+        assert_rehearsed_clean(&m);
+        let m = fx.apply(m.id).await;
+        assert_done(&m);
+
+        assert_eq!(
+            fx.value(
+                fx.main,
+                "SELECT rolcreaterole::text || ',' || rolcreatedb::text || ',' || rolreplication::text \
+                 || ',' || rolbypassrls::text || ',' || pg_has_role('boss', 'neon_superuser', 'MEMBER')::text \
+                 FROM pg_roles WHERE rolname = 'boss';"
+            )
+            .await,
+            "false,false,false,true,false"
+        );
+    })
+    .await;
+}
+
 /// After-merge choices: reset (the source goes back to its parent), delete refused by a child
 /// (recorded, the merge still done), and delete.
 #[tokio::test]

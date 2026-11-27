@@ -138,6 +138,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Ok(plan) => plan,
             Err(why) => return self.end_rehearsal(id, MergeStatus::Draft, back(why)).await,
         };
+        if let Some(why) = super::outdated(&plan) {
+            return self.end_rehearsal(id, MergeStatus::Draft, back(why)).await;
+        }
         let target = match self.merge_target(&merge).await? {
             Ok(target) => target,
             Err(why) => return self.end_rehearsal(id, MergeStatus::Draft, back(why)).await,

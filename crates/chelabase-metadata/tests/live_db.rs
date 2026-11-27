@@ -22,7 +22,7 @@ use chelabase_metadata::{
     DEMO_PROJECT_ID, DEMO_TENANT_ID,
 };
 use chelabase_metadata::{
-    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
+    ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleField, RoleWriteOutcome, SecretChange,
 };
 use chelabase_metadata::members::Admission;
 use chelabase_time::{Timestamp, TimestampExt};
@@ -4004,6 +4004,7 @@ async fn rows_written_before_the_swap_read_back_equal() {
             attributes,
             secret: SecretChange::Keep,
             change_id: uuid::Uuid::new_v4(),
+            named: RoleField::all(),
         };
         client.update_api_role(&ep, "kept", &change, 10).await.unwrap();
         let same: bool = sqlx::query_scalar(
@@ -4087,6 +4088,7 @@ async fn api_role_attributes_insert_and_update() {
         attributes: member.clone(),
         secret: SecretChange::Set("SCRAM-SHA-256$n".into(), "v1:n".into()),
         change_id: uuid::Uuid::new_v4(),
+        named: RoleField::all(),
     };
     let updated = client.update_api_role(&ep, "readers", &change, 10).await.unwrap();
     let missing = client.update_api_role(&ep, "ghost", &change, 10).await.unwrap();
@@ -8560,6 +8562,7 @@ async fn login_on_respects_the_cap() {
         attributes: plain.clone(),
         secret: SecretChange::Set("SCRAM-SHA-256$n".into(), "v1:n".into()),
         change_id: uuid::Uuid::new_v4(),
+        named: RoleField::all(),
     };
     let first = client.update_api_role(&ep, "g1", &on, 2).await.unwrap();
     let second = client.update_api_role(&ep, "g2", &on, 2).await.unwrap();
@@ -8614,7 +8617,7 @@ async fn attributes_pending_follows_api_writes() {
     let (after_confirm, _, _) = state(client.clone(), ep.clone()).await;
     client.replace_role_secret(&ep, "app", "SCRAM-SHA-256$b", "v1:b").await.unwrap();
     let (after_reset, _, _) = state(client.clone(), ep.clone()).await;
-    let change = ApiRoleChange { owner_level: false, login: true, attributes: RoleAttributes::default(), secret: SecretChange::Keep, change_id: uuid::Uuid::new_v4() };
+    let change = ApiRoleChange { owner_level: false, login: true, attributes: RoleAttributes::default(), secret: SecretChange::Keep, change_id: uuid::Uuid::new_v4(), named: RoleField::all() };
     client.update_api_role(&ep, "app", &change, 10).await.unwrap();
     let (after_patch, _, v) = state(client.clone(), ep.clone()).await;
     let mut recorded = upsert("app", RoleOrigin::Api, "SCRAM-SHA-256$b");
@@ -8667,7 +8670,7 @@ async fn confirm_clears_attributes_by_change_id() {
     let after_lost = flags(client.clone(), ep.clone()).await;
     // A newer change, then a confirm of the older one.
     let second = uuid::Uuid::new_v4();
-    let change = ApiRoleChange { owner_level: false, login: false, attributes: plain.clone(), secret: SecretChange::Keep, change_id: second };
+    let change = ApiRoleChange { owner_level: false, login: false, attributes: plain.clone(), secret: SecretChange::Keep, change_id: second, named: RoleField::all() };
     client.update_api_role(&ep, "app", &change, 10).await.unwrap();
     let (_, v) = client.role_copies(&ep).await.unwrap();
     // The stale confirm carries what its own (older) write read: the first version and id.
@@ -8681,6 +8684,77 @@ async fn confirm_clears_attributes_by_change_id() {
     assert_eq!(after_stale, (true, true), "an older version leaves pending, an older id leaves the attributes pending");
     assert!(confirmed);
     assert_eq!(after_confirm, (false, false));
+}
+
+// #425: `attributes_named` records the fields a pending change named. A create names every
+// field; a PATCH over a settled row names only its own; one over a still-pending change joins
+// it, so neither is lost; applying it (a confirm or a resync) resets it to every field; a
+// field outside the vocabulary is refused.
+#[tokio::test]
+#[ignore]
+async fn a_pending_change_records_the_fields_it_named() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let (id, ep) = ready_database(&client).await;
+    let plain = RoleAttributes::default();
+    let first = uuid::Uuid::new_v4();
+    let role = NewApiRole { name: "app", owner_level: false, login: false, attributes: &plain, verifier: None, password_enc: None, change_id: first };
+    client.insert_api_role_with(&ep, &role, 10).await.unwrap();
+    let named = |client: MetadataClient, ep: String| async move {
+        let (copies, _) = client.role_copies(&ep).await.unwrap();
+        let app = copies.into_iter().find(|c| c.name == "app").unwrap();
+        (app.attributes_pending, app.attributes_named)
+    };
+    let created = named(client.clone(), ep.clone()).await;
+    let patch = |fields: &[RoleField]| ApiRoleChange {
+        owner_level: false,
+        login: false,
+        attributes: plain.clone(),
+        secret: SecretChange::Keep,
+        change_id: uuid::Uuid::new_v4(),
+        named: fields.iter().copied().collect(),
+    };
+    // Over the pending create: still every field.
+    client.update_api_role(&ep, "app", &patch(&[RoleField::ConnectionLimit]), 10).await.unwrap();
+    let over_create = named(client.clone(), ep.clone()).await;
+    // Settled, then a PATCH of the limit alone, then one of the expiry before it's applied.
+    let limit = patch(&[RoleField::ConnectionLimit]);
+    sqlx::query("UPDATE neon_roles SET attributes_pending = false WHERE endpoint_id = $1 AND name = 'app'")
+        .bind(&ep)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    client.update_api_role(&ep, "app", &limit, 10).await.unwrap();
+    let alone = named(client.clone(), ep.clone()).await;
+    let expiry = patch(&[RoleField::ValidUntil]);
+    client.update_api_role(&ep, "app", &expiry, 10).await.unwrap();
+    let joined = named(client.clone(), ep.clone()).await;
+    // Applied (the confirm of the latest change): back to every field.
+    let (_, v) = client.role_copies(&ep).await.unwrap();
+    client.confirm_role(&ep, "app", v, Some(expiry.change_id)).await.unwrap();
+    let confirmed = named(client.clone(), ep.clone()).await;
+    // Applied by a resync: the same.
+    client.update_api_role(&ep, "app", &patch(&[RoleField::Inherit]), 10).await.unwrap();
+    let narrowed = named(client.clone(), ep.clone()).await;
+    let (_, read) = client.role_copies(&ep).await.unwrap();
+    let mut row = upsert("app", RoleOrigin::Api, SQL_VERIFIER);
+    row.login = false;
+    let write = ResyncWrite { upserts: vec![row], removals: vec![], databases: vec![observed("db", "postgres", false)] };
+    client.apply_resync(&ep, main_of(id), read, &write).await.unwrap();
+    let resynced = named(client.clone(), ep.clone()).await;
+    let unknown = sqlx::query("UPDATE neon_roles SET attributes_named = ARRAY['password'] WHERE endpoint_id = $1 AND name = 'app'")
+        .bind(&ep)
+        .execute(client.pool())
+        .await;
+    cleanup(&client, id).await;
+    assert_eq!(created, (true, RoleField::all()), "a create names every field");
+    assert_eq!(over_create, (true, RoleField::all()), "joined to the create's");
+    assert_eq!(alone, (true, [RoleField::ConnectionLimit].into()), "only the PATCH's own");
+    assert_eq!(joined, (true, [RoleField::ConnectionLimit, RoleField::ValidUntil].into()), "both pending changes'");
+    assert_eq!(confirmed, (false, RoleField::all()), "a confirm resets the set");
+    assert_eq!(narrowed, (true, [RoleField::Inherit].into()));
+    assert_eq!(resynced, (false, RoleField::all()), "a resync's apply resets the set");
+    assert!(unknown.is_err(), "the vocabulary is checked: {unknown:?}");
 }
 
 // F2 fix round M7: only a secret key can be marked as bypassing RLS.

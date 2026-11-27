@@ -273,6 +273,7 @@ async fn origin_after_resync(marked: bool) -> RoleOrigin {
                 api_owner_level: false,
                 attributes: Default::default(),
                 attributes_pending: false,
+                attributes_named: chelabase_metadata::RoleField::all(),
                 attributes_change_id: None,
             },
         );

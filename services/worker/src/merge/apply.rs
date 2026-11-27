@@ -178,6 +178,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Ok(plan) => plan,
             Err(why) => return self.back_to_rehearsed(id, why).await,
         };
+        if let Some(why) = super::outdated(&plan) {
+            return self.back_to_rehearsed(id, why).await;
+        }
         let missing = unacknowledged(merge, &plan);
         if !missing.is_empty() {
             let why = format!(
@@ -1688,5 +1691,163 @@ mod tests {
         apply(&w, id).await;
         let m = w.metadata.merge_row(id);
         assert_eq!(m.status, MergeStatus::Done, "{:?} {:?}", m.error, m.result);
+    }
+
+    /// `app` of the owner-level cases below: with BYPASSRLS, owner-level or not.
+    fn app_role(owner_level: bool) -> serde_json::Value {
+        let mut r = crate::merge::testkit::role(16460, "app", true, true);
+        if owner_level {
+            r["member_of"] = json!([{
+                "role": { "oid": 16399, "name": "neon_superuser" },
+                "grantor": { "oid": 10, "name": "cloud_admin" },
+                "admin": false, "inherit": true, "set": true,
+            }]);
+            r["other_attributes"] = json!(["CREATEDB", "CREATEROLE", "REPLICATION"]);
+        }
+        r
+    }
+
+    /// A catalog holding `orders` and `app`. The test kit's owner has the bootstrap superuser's
+    /// OID (10), so the merge reads that grantor of the owner's ADMIN membership in a role both
+    /// sides already have under the owner's name; these catalogs name it so from the start.
+    fn app_catalog(owner_level: bool) -> String {
+        crate::merge::testkit::catalog_with_roles(&[orders()], &[app_role(owner_level)])
+            .replace("\"cloud_admin\"", "\"postgres\"")
+    }
+
+    /// From now on `ep`'s catalog read answers [`app_catalog`].
+    fn answer_app(w: &FakeWorker, ep: &str, owner_level: bool) {
+        let mut answers = w.computes.answers_at.lock().unwrap();
+        answers.retain(|(e, needle, _)| !(e == ep && needle == CATALOG_READ));
+        drop(answers);
+        w.computes.answer_at(ep, CATALOG_READ, &app_catalog(owner_level));
+    }
+
+    /// From now on a rehearsal's catalog read answers `app` without owner level.
+    fn answer_app_elsewhere(w: &FakeWorker) {
+        let mut answers = w.computes.answers_in.lock().unwrap();
+        answers.retain(|(db, needle, _)| !(db == "app" && needle == CATALOG_READ));
+        drop(answers);
+        w.computes.answer_in("app", CATALOG_READ, &app_catalog(false));
+    }
+
+    /// A computed merge whose source took owner level away from `app` and kept its BYPASSRLS,
+    /// onto a target where `app` is still owner-level (as every compute's role read says).
+    async fn owner_level_taken_away(w: &FakeWorker) -> (crate::merge::testkit::Setup, Uuid) {
+        let s = setup(w).await;
+        // The branch point already had the role, owner-level.
+        let base = chelabase_schema::catalog::parse_catalog(&app_catalog(true)).unwrap();
+        for b in &mut w.metadata.state().schema_bases {
+            if b.branch_id == s.dev.id && b.model.is_some() {
+                b.model = Some(serde_json::to_value(&base).unwrap());
+            }
+        }
+        answer_app(w, s.main_ep(), true);
+        answer_app(w, s.dev_ep(), false);
+        let id = w.metadata.insert_merge(
+            s.db,
+            s.dev.id,
+            s.main.id,
+            chelabase_metadata::MergeDirection::IntoParent,
+            MergeStatus::Computing,
+        );
+        job(w, MergeJob::Compute { merge_id: id }, 1).await;
+        let m = w.metadata.merge_row(id);
+        assert!(m.plan.is_some(), "a plan: {:?} {:?} {:?}", m.status, m.error, m.analysis);
+        let mut app = crate::resync::ObservedRole::plain("app");
+        app.owner_level = true;
+        app.owner_attributes = true;
+        app.bypass_rls = true;
+        w.computes
+            .answer("WHERE a.rolname = 'app';", &crate::resync::role_line(&app));
+        (s, id)
+    }
+
+    fn ran_anywhere(w: &FakeWorker, needle: &str) -> usize {
+        let all = w.computes.sql.lock().unwrap();
+        all.iter().filter(|(_, _, q)| q.contains(needle)).count()
+    }
+
+    // #425: a merged role that lost owner level and kept BYPASSRLS. The plan names BYPASSRLS,
+    // and the role step leaves the role as the merged model has it, in the rehearsal and in
+    // the apply; the merge ends without drift.
+    #[tokio::test]
+    async fn a_merge_that_takes_owner_level_away_leaves_bypassrls_as_the_merged_model_has_it() {
+        use chelabase_schema::plan::{RoleOp, RolePatchModel};
+        let (w, _journal) = worker();
+        let (s, id) = owner_level_taken_away(&w).await;
+        let plan = crate::merge::stored_plan(&w.metadata.merge_row(id)).unwrap();
+        assert_eq!(
+            plan.steps[0].role_op,
+            Some(RoleOp::Update {
+                name: "app".into(),
+                patch: RolePatchModel {
+                    owner_level: Some(false),
+                    bypass_rls: Some(true),
+                    ..Default::default()
+                },
+            })
+        );
+        assert!(plan.steps[0].sql.contains("BYPASSRLS"), "{}", plan.steps[0].sql);
+        const KEPT: &str = "ALTER ROLE \"app\" NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS;\nREVOKE neon_superuser FROM \"app\";";
+
+        answer_app_elsewhere(&w);
+        move_to(&w, id, MergeStatus::Rehearsing);
+        job(&w, MergeJob::Rehearse { merge_id: id }, 1).await;
+        let m = w.metadata.merge_row(id);
+        assert_eq!(m.status, MergeStatus::Rehearsed, "{:?}", m.error);
+        assert_eq!(ran_anywhere(&w, KEPT), 1, "the rehearsal's role step");
+        assert_eq!(ran(&w, s.main_ep(), "ALTER ROLE \"app\""), 0);
+
+        acknowledge_all(&w, id);
+        answer_app(&w, s.main_ep(), false);
+        move_to(&w, id, MergeStatus::Applying);
+        w.computes
+            .answer_once_at(s.main_ep(), CATALOG_READ, &app_catalog(true));
+        apply(&w, id).await;
+        let m = w.metadata.merge_row(id);
+        assert_eq!(m.status, MergeStatus::Done, "{:?} {:?}", m.error, m.result);
+        assert_eq!(ran(&w, s.main_ep(), KEPT), 1, "the apply's role step");
+        assert_eq!(ran_anywhere(&w, "ALTER ROLE \"app\""), 2, "nothing else changed the role");
+    }
+
+    // #425: a plan stored before role diffs named BYPASSRLS on owner-level removal doesn't say
+    // what the merged model has. It's recomputed first: neither the rehearsal nor the apply
+    // runs anything of it.
+    #[tokio::test]
+    async fn a_plan_that_takes_owner_level_away_without_naming_bypassrls_is_recomputed_first() {
+        use chelabase_schema::plan::RoleOp;
+        let (w, _journal) = worker();
+        let (s, id) = owner_level_taken_away(&w).await;
+        {
+            let mut plan = crate::merge::stored_plan(&w.metadata.merge_row(id)).unwrap();
+            let Some(RoleOp::Update { patch, .. }) = &mut plan.steps[0].role_op else {
+                panic!("{:?}", plan.steps[0].role_op)
+            };
+            patch.bypass_rls = None;
+            w.metadata.state().merges.get_mut(&id).unwrap().plan =
+                Some(serde_json::to_value(&plan).unwrap());
+        }
+        answer_app_elsewhere(&w);
+
+        move_to(&w, id, MergeStatus::Rehearsing);
+        job(&w, MergeJob::Rehearse { merge_id: id }, 1).await;
+        let m = w.metadata.merge_row(id);
+        assert_eq!(m.status, MergeStatus::Draft);
+        let error = m.error.unwrap_or_default();
+        assert!(error.contains("BYPASSRLS") && error.contains("recompute the merge"), "{error}");
+        assert_eq!(ran_anywhere(&w, "ALTER ROLE \"app\""), 0);
+
+        acknowledge_all(&w, id);
+        move_to(&w, id, MergeStatus::Applying);
+        w.computes
+            .answer_once_at(s.main_ep(), CATALOG_READ, &app_catalog(true));
+        apply(&w, id).await;
+        let m = w.metadata.merge_row(id);
+        assert_eq!(m.status, MergeStatus::Rehearsed);
+        let error = m.error.unwrap_or_default();
+        assert!(error.contains("BYPASSRLS") && error.contains("recompute the merge"), "{error}");
+        assert_eq!(ran_anywhere(&w, "ALTER ROLE \"app\""), 0);
+        assert_eq!(ran(&w, s.main_ep(), "$chelabase_guard$"), 0);
     }
 }

@@ -4,9 +4,9 @@
     "version": "1",
     "x-sources": {
       "data": "2c19d513db77381e0405a346f59c082d6af798757a6d40a96ed7377efe3e5de4",
-      "management": "327c50790a081dd4273dc5def1ed0fa9c58adb29bf529a557c1b1ffcacf19d4c"
+      "management": "e8e6a71499ae5c18eb44f6ed745d8b880258b12657059bc1e17888a6b25dbb39"
     },
-    "x-spec-hash": "a460bae6ed126e29c4dc789f71165132ba4a00dc10ef1d2090dfe97158f3b726"
+    "x-spec-hash": "40df4ae3b4ca9e508253404b79d58c48344639aa6eee501a29b38e70c0768e43"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -12004,7 +12004,7 @@
         }
       },
       "patch": {
-        "description": "Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.",
+        "description": "Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Taking owner level away removes every owner attribute the role has, and BYPASSRLS too unless the same change sets `bypass_rls: true`. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.",
         "operationId": "updateRole",
         "parameters": [
           {
@@ -12082,7 +12082,7 @@
                     ]
                   },
                   "owner_level": {
-                    "description": "Owner-level on (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, `neon_superuser`) or off.",
+                    "description": "Owner-level on (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, `neon_superuser`) or off.\nTurning it off removes every owner attribute the role has, and BYPASSRLS too unless the\nsame change sets `bypass_rls: true`.",
                     "type": [
                       "boolean",
                       "null"

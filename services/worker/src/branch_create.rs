@@ -1491,6 +1491,7 @@ mod tests {
                 api_owner_level: false,
                 attributes: chelabase_metadata::RoleAttributes::default(),
                 attributes_pending: false,
+                attributes_named: chelabase_metadata::RoleField::all(),
                 attributes_change_id: None,
             },
         );

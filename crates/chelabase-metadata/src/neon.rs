@@ -1,6 +1,7 @@
 //! Neon endpoints, roles and databases: what the proxy, compute_ctl and the storage
 //! controller ask the orchestrator's internal listener about.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use crate::{BranchStatus, MetadataClient, MetadataError, ServedDatabase};
@@ -155,6 +156,61 @@ impl RoleLevel {
     }
 }
 
+/// A field an API create or PATCH can name (#425): an `api` row's `attributes_named` lists
+/// the ones its pending change named, and only those are driven onto the compute; the rest
+/// follow the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoleField {
+    OwnerLevel,
+    Login,
+    Inherit,
+    ConnectionLimit,
+    ValidUntil,
+    BypassRls,
+    MemberOf,
+}
+
+impl RoleField {
+    /// Every field: what a create names.
+    pub const ALL: [RoleField; 7] = [
+        Self::OwnerLevel,
+        Self::Login,
+        Self::Inherit,
+        Self::ConnectionLimit,
+        Self::ValidUntil,
+        Self::BypassRls,
+        Self::MemberOf,
+    ];
+
+    /// [`Self::ALL`] as a set.
+    pub fn all() -> BTreeSet<RoleField> {
+        Self::ALL.into_iter().collect()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OwnerLevel => "owner_level",
+            Self::Login => "login",
+            Self::Inherit => "inherit",
+            Self::ConnectionLimit => "connection_limit",
+            Self::ValidUntil => "valid_until",
+            Self::BypassRls => "bypass_rls",
+            Self::MemberOf => "member_of",
+        }
+    }
+
+    pub(crate) fn parse(s: &str) -> Result<Self, MetadataError> {
+        Self::ALL
+            .into_iter()
+            .find(|f| f.as_str() == s)
+            .ok_or_else(|| MetadataError::InvalidStatus(format!("role field {s}")))
+    }
+}
+
+fn field_names(fields: &BTreeSet<RoleField>) -> Vec<&'static str> {
+    fields.iter().map(|f| f.as_str()).collect()
+}
+
 /// A role's attributes beyond LOGIN and owner-level (U2), and its memberships. For an `api`
 /// row they're what the control plane wants; for an `sql` row, what the catalog last showed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,6 +289,9 @@ pub struct ApiRoleChange {
     pub secret: SecretChange,
     /// Names this change (`attributes_change_id`): its confirm clears `attributes_pending` by it.
     pub change_id: uuid::Uuid,
+    /// The fields the PATCH set (#425): only these are driven while the change is pending.
+    /// Joined to the row's set when an earlier change is still pending, so neither is lost.
+    pub named: BTreeSet<RoleField>,
 }
 
 /// Where a role's password stands, as Studio shows it.
@@ -270,6 +329,9 @@ pub struct RoleCopy {
     /// attributes and memberships, and the compute hasn't confirmed them yet. Only then does the
     /// resync drive them onto the compute; otherwise it records the catalog's.
     pub attributes_pending: bool,
+    /// The fields the pending change named (#425; every field for a create): only these are
+    /// driven, the others follow the catalog. Meaningful only while `attributes_pending`.
+    pub attributes_named: BTreeSet<RoleField>,
     pub created_at: Timestamp,
     pub attributes: RoleAttributes,
 }
@@ -287,6 +349,7 @@ impl std::fmt::Debug for RoleCopy {
             .field("api_owner_level", &self.api_owner_level)
             .field("pending", &self.pending)
             .field("attributes_pending", &self.attributes_pending)
+            .field("attributes_named", &self.attributes_named)
             .field("created_at", &self.created_at)
             .field("attributes", &self.attributes)
             .finish()
@@ -424,7 +487,8 @@ pub struct ObservedDatabase {
 
 /// Insert-or-update one row. `origin` is used only on insert; an existing row keeps its origin.
 /// `verifier: None` stores NULL (MD5). The row's `attributes_pending` becomes false (the
-/// resync applied or recorded them). Debug redacts the verifier.
+/// resync applied or recorded them) and its `attributes_named` every field again (#425). Debug
+/// redacts the verifier.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CopyUpsert {
     pub name: String,
@@ -570,6 +634,11 @@ pub(crate) fn copy_from_row(row: &sqlx::postgres::PgRow) -> Result<RoleCopy, Met
         api_owner_level: row.try_get("api_owner_level")?,
         pending: row.try_get("pending")?,
         attributes_pending: row.try_get("attributes_pending")?,
+        attributes_named: row
+            .try_get::<Vec<String>, _>("attributes_named")?
+            .iter()
+            .map(|f| RoleField::parse(f))
+            .collect::<Result<_, _>>()?,
         created_at: row.try_get("created_at")?,
         attributes: attributes_from_row(row)?,
     })
@@ -653,6 +722,7 @@ mod tests {
             api_owner_level: false,
             pending: true,
             attributes_pending: false,
+            attributes_named: RoleField::all(),
             created_at: Timestamp::now(),
             attributes: RoleAttributes::default(),
         };
@@ -878,7 +948,8 @@ impl MetadataClient {
     ) -> Result<(Vec<RoleCopy>, i64), MetadataError> {
         let rows = sqlx::query(
             "SELECT e.roles_version, r.name, r.origin, r.scram_verifier, r.password_enc, r.login,
-                    r.level, r.api_owner_level, r.pending, r.attributes_pending, r.created_at,
+                    r.level, r.api_owner_level, r.pending, r.attributes_pending, r.attributes_named,
+                    r.created_at,
                     r.inherit, r.connection_limit, r.valid_until, r.bypass_rls, r.member_of,
                     r.member_no_set, r.member_admin
              FROM neon_endpoints e
@@ -1286,7 +1357,7 @@ impl MetadataClient {
     /// the writers of its roles), counts its copies (rows of origin `sql` or `api` with a
     /// verifier; at `cap` or more is `CapReached`), and inserts an `api` row with
     /// `pending = true`, `attributes_pending = true` (E32: its wanted state is driven until the
-    /// compute confirms it) and the level from `owner_level` (a name already there is `Exists`).
+    /// compute confirms it; `attributes_named` keeps its default, every field) and the level from `owner_level` (a name already there is `Exists`).
     /// Then `roles_version += 1` (no reconfigure: the spec lists only the owner). An unknown endpoint is a
     /// `RowNotFound` database error.
     pub async fn insert_api_role(
@@ -1368,7 +1439,8 @@ impl MetadataClient {
 
     /// One transaction: an `api` row's new wanted state (level, LOGIN, attributes, memberships
     /// and, per `change.secret`, its verifier and sealed password), `pending = true`,
-    /// `attributes_pending = true`, `roles_version += 1` (no reconfigure: the spec lists only
+    /// `attributes_pending = true`, `attributes_named` = `change.named` (joined to the row's
+    /// set when it was already pending, #425), `roles_version += 1` (no reconfigure: the spec lists only
     /// the owner). `NotFound` when the endpoint has no `api` row of that name. Giving a row
     /// without a verifier one (LOGIN turned on) is `CapReached` when the endpoint already has
     /// `cap` copies, counted under the endpoint's lock like [`Self::insert_api_role_with`].
@@ -1415,7 +1487,11 @@ impl MetadataClient {
                  password_enc = CASE $11::int WHEN 0 THEN password_enc ELSE $13 END,
                  password_unreadable = CASE $11::int WHEN 0 THEN password_unreadable ELSE false END,
                  pending = true, attributes_pending = true, attributes_change_id = $14,
-                 member_no_set = $15, member_admin = $16
+                 member_no_set = $15, member_admin = $16,
+                 attributes_named = CASE WHEN attributes_pending
+                     THEN ARRAY(SELECT DISTINCT f FROM unnest(attributes_named || $17::text[]) AS f
+                                ORDER BY f)
+                     ELSE $17::text[] END
              WHERE endpoint_id = $1 AND name = $2 AND origin = 'api'",
         )
         .bind(endpoint_id)
@@ -1434,6 +1510,7 @@ impl MetadataClient {
         .bind(change.change_id)
         .bind(&a.member_no_set)
         .bind(&a.member_admin)
+        .bind(field_names(&change.named))
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -1539,7 +1616,8 @@ impl MetadataClient {
         Ok(true)
     }
 
-    /// Confirms one row's applied write. `attributes_pending` is cleared when `attributes_change`
+    /// Confirms one row's applied write. `attributes_pending` is cleared (and `attributes_named`
+    /// set back to every field, #425) when `attributes_change`
     /// names the row's current `attributes_change_id` (the API write just applied), whatever
     /// `roles_version` says: another write (a forwarded DDL) bumping it meanwhile doesn't make
     /// this change stale, while a newer API change keeps its own flag. `pending` (the password
@@ -1563,7 +1641,7 @@ impl MetadataClient {
         .await?;
         if let Some(change) = attributes_change {
             sqlx::query(
-                "UPDATE neon_roles SET attributes_pending = false
+                "UPDATE neon_roles SET attributes_pending = false, attributes_named = DEFAULT
                  WHERE endpoint_id = $1 AND name = $2 AND attributes_pending
                    AND attributes_change_id = $3 AND origin <> 'personal'",
             )
@@ -1836,6 +1914,7 @@ impl MetadataClient {
                      member_no_set = EXCLUDED.member_no_set,
                      member_admin = EXCLUDED.member_admin,
                      attributes_pending = false,
+                     attributes_named = DEFAULT,
                      api_owner_level = CASE WHEN r.origin = 'api' AND $15::bool IS NOT NULL
                                             THEN $15 ELSE r.api_owner_level END,
                      password_unreadable = CASE WHEN NOT {held}

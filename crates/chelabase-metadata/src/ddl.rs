@@ -146,7 +146,8 @@ impl DdlTx {
     pub async fn role(&mut self, name: &str) -> Result<Option<RoleCopy>, MetadataError> {
         let row = sqlx::query(
             "SELECT r.name, r.origin, r.scram_verifier, r.password_enc, r.login, r.level,
-                    r.api_owner_level, r.pending, r.attributes_pending, r.created_at, r.inherit,
+                    r.api_owner_level, r.pending, r.attributes_pending, r.attributes_named,
+                    r.created_at, r.inherit,
                     r.connection_limit,
                     r.valid_until, r.bypass_rls, r.member_of, r.member_no_set, r.member_admin
              FROM neon_roles r WHERE r.endpoint_id = $1 AND r.name = $2",

@@ -238,6 +238,8 @@ pub(crate) struct CreateRoleRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct UpdateRoleRequest {
     /// Owner-level on (CREATEROLE, CREATEDB, BYPASSRLS, REPLICATION, `neon_superuser`) or off.
+    /// Turning it off removes every owner attribute the role has, and BYPASSRLS too unless the
+    /// same change sets `bypass_rls: true`.
     #[serde(default)]
     owner_level: Option<bool>,
     /// Turning LOGIN on generates a password (read it with the connection details and
@@ -1147,7 +1149,7 @@ where
     operation_id = "updateRole",
     tag = "roles",
     summary = "Change a role",
-    description = "Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.",
+    description = "Changes a role's LOGIN, owner level, attributes or memberships; fields left out stay as they are, and `valid_until: null` clears the expiry. Taking owner level away removes every owner attribute the role has, and BYPASSRLS too unless the same change sets `bypass_rls: true`. Turning LOGIN on generates a password (read it with the connection details and `role`); turning it off drops the password. `member_of` replaces the list of the role's other memberships (`pg_*` and Chelabase's own groups stay). Works on roles made through the API, and on roles made in SQL that the owner administers; the owner can't be changed. A change starts from the role as SQL left it: SQL controls every role's attributes and memberships. Turning LOGIN on counts toward the branch's login-role cap. Answers with the role, never a password.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
