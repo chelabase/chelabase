@@ -532,12 +532,28 @@ pub(crate) fn hardwired_defaults(
     }
 }
 
+/// The earliest expiry a merge writes, in RFC 3339: `0001-01-01T00:00:00Z`, the worker's
+/// `Timestamp::PG_ROUND_TRIP_MIN` (the earliest instant that round trips through Postgres;
+/// the worker's `merge::phases` tests read this text as that constant).
+pub(crate) const EXPIRY_FLOOR: &str = "0001-01-01T00:00:00+00:00";
+
+/// Whether `rolvaliduntil` as Postgres prints it (DateStyle ISO, UTC) is `-infinity` or before
+/// [`EXPIRY_FLOOR`] (a BC time; every instant before year 1 is one).
+fn before_the_floor(pg: &str) -> bool {
+    pg == "-infinity" || pg.ends_with(" BC")
+}
+
 /// `rolvaliduntil` as Postgres prints it (`2030-01-01 00:00:00+00`) in RFC 3339
-/// (`2030-01-01T00:00:00+00:00`); `infinity` is no expiry. Text in another shape passes as is.
+/// (`2030-01-01T00:00:00+00:00`); `infinity` is no expiry. `-infinity` and a BC time are
+/// [`EXPIRY_FLOOR`], as the worker's resync reads them (#398, #424): the role stays expired, at
+/// a value the worker parses and Postgres reads back. Text in another shape passes as is.
 pub(super) fn rfc3339(pg: &str) -> Option<String> {
     let s = pg.trim();
     if s == "infinity" {
         return None;
+    }
+    if before_the_floor(s) {
+        return Some(EXPIRY_FLOOR.to_string());
     }
     let Some((date, rest)) = s.split_once(' ') else {
         return Some(s.to_string());
@@ -551,6 +567,26 @@ pub(super) fn rfc3339(pg: &str) -> Option<String> {
         _ => offset.to_string(),
     };
     Some(format!("{date}T{time}{offset}"))
+}
+
+/// A `rolvaliduntil` (as Postgres prints it) as a merge compares it: one at or before
+/// [`EXPIRY_FLOOR`] (`-infinity`, a BC time, the floor itself) as the floor as Postgres prints
+/// it, anything else as is. So a role a merge left at the floor is the same expiry as a source
+/// still at `-infinity`: neither patched again nor drift (#424). `infinity` and none stay
+/// apart, as before.
+pub(crate) fn expiry_key(v: Option<&str>) -> Option<&str> {
+    v.map(|v| {
+        if before_the_floor(v.trim()) || rfc3339(v).as_deref() == Some(EXPIRY_FLOOR) {
+            "0001-01-01 00:00:00+00"
+        } else {
+            v
+        }
+    })
+}
+
+/// Whether two `rolvaliduntil` values are one expiry for a merge ([`expiry_key`]).
+pub(super) fn same_expiry(a: Option<&str>, b: Option<&str>) -> bool {
+    expiry_key(a) == expiry_key(b)
 }
 
 #[cfg(test)]
@@ -608,6 +644,47 @@ mod tests {
             Some("2030-01-01T10:00:00.5-05:30")
         );
         assert_eq!(rfc3339("infinity"), None);
+    }
+
+    // #424: a role expired with `-infinity` or a BC time merges expired at the floor resync
+    // reads it as (`0001-01-01T00:00:00Z`, `Timestamp::PG_ROUND_TRIP_MIN`, #398), never as no
+    // expiry and never as text no time type reads back.
+    #[test]
+    fn an_expiry_before_year_one_becomes_the_floor() {
+        let floor = Some("0001-01-01T00:00:00+00:00");
+        assert_eq!(rfc3339("-infinity").as_deref(), floor);
+        for bc in [
+            "0001-12-31 23:59:59.999999+00 BC",
+            "0044-03-15 12:00:00+00 BC",
+            "4714-11-24 00:00:00+00 BC",
+        ] {
+            assert_eq!(rfc3339(bc).as_deref(), floor, "{bc}");
+        }
+        // The floor itself, and the first instant after it, as Postgres prints them.
+        assert_eq!(rfc3339("0001-01-01 00:00:00+00").as_deref(), floor);
+        assert_eq!(
+            rfc3339("0001-01-01 00:00:00.000001+00").as_deref(),
+            Some("0001-01-01T00:00:00.000001+00:00")
+        );
+        assert_eq!(rfc3339("infinity"), None);
+        // Same expiry: the floor and everything Postgres prints before it are one value.
+        for (a, b) in [
+            (Some("-infinity"), Some("0001-01-01 00:00:00+00")),
+            (Some("0044-03-15 12:00:00+00 BC"), Some("-infinity")),
+            (Some("2030-01-01 00:00:00+00"), Some("2030-01-01 00:00:00+00")),
+            (None, None),
+        ] {
+            assert!(same_expiry(a, b), "{a:?} {b:?}");
+        }
+        for (a, b) in [
+            (Some("-infinity"), None),
+            (Some("-infinity"), Some("infinity")),
+            (Some("0044-03-15 12:00:00+00 BC"), Some("0001-01-01 00:00:00.000001+00")),
+            (Some("infinity"), None),
+            (Some("2030-01-01 00:00:00+00"), Some("2031-01-01 00:00:00+00")),
+        ] {
+            assert!(!same_expiry(a, b), "{a:?} {b:?}");
+        }
     }
 
     #[test]

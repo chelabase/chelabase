@@ -103,7 +103,8 @@ fn by_hand(b: Option<&Role>, t: Option<&Role>, s: &Role) -> Vec<String> {
                     r.login,
                     r.inherit,
                     r.connection_limit,
-                    r.valid_until.clone(),
+                    // #424: one expiry at or before the floor, however it is spelled.
+                    crate::plan::ddl::expiry_key(r.valid_until.as_deref()).map(str::to_string),
                     r.bypass_rls,
                 )
             })

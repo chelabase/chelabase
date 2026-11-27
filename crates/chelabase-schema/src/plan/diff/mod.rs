@@ -1274,7 +1274,7 @@ fn role_steps(
                 if tr.connection_limit != mr.connection_limit {
                     patch.connection_limit = Some(mr.connection_limit);
                 }
-                if tr.valid_until != mr.valid_until {
+                if !ddl::same_expiry(tr.valid_until.as_deref(), mr.valid_until.as_deref()) {
                     patch.valid_until = Some(mr.valid_until.as_deref().and_then(ddl::rfc3339));
                 }
                 if tr.bypass_rls != mr.bypass_rls {

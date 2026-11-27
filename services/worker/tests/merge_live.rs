@@ -1197,6 +1197,46 @@ async fn nologin_group_role_and_login_role_created_through_control_plane() {
     .await;
 }
 
+/// #424: roles expired with `-infinity` or a BC time, made or changed on the source, merge
+/// expired at the floor resync reads them as (`0001-01-01T00:00:00Z`, #398): the plan applies,
+/// and neither the rehearsal nor the apply reports the floor as drift.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn roles_expired_before_year_one_merge_at_the_floor() {
+    live(|fx| async move {
+        fx.owner(fx.main, BASE).await;
+        fx.owner(fx.main, "CREATE ROLE exp_patch NOLOGIN VALID UNTIL '2030-01-01T00:00:00Z';")
+            .await;
+        let dev = fx.child("dev", fx.main).await;
+        fx.owner(
+            dev,
+            "CREATE ROLE exp_neg NOLOGIN VALID UNTIL '-infinity';
+             CREATE ROLE exp_bc NOLOGIN VALID UNTIL '0044-03-15 12:00:00+00 BC';
+             ALTER ROLE exp_patch VALID UNTIL '-infinity';",
+        )
+        .await;
+
+        let m = fx.merge_into_main(dev).await;
+        assert_planned(&m);
+        println!("plan:\n{}", plan_text(&m));
+        let m = fx.rehearse(m.id).await;
+        assert_rehearsed_clean(&m);
+        let m = fx.apply(m.id).await;
+        assert_done(&m);
+
+        assert_eq!(
+            fx.value(
+                fx.main,
+                "SELECT string_agg(rolname || ':' || (extract(epoch FROM rolvaliduntil) * 1000000)::bigint, ',' \
+                 ORDER BY rolname) FROM pg_roles WHERE rolname LIKE 'exp\\_%';"
+            )
+            .await,
+            "exp_bc:-62135596800000000,exp_neg:-62135596800000000,exp_patch:-62135596800000000"
+        );
+    })
+    .await;
+}
+
 /// After-merge choices: reset (the source goes back to its parent), delete refused by a child
 /// (recorded, the merge still done), and delete.
 #[tokio::test]
