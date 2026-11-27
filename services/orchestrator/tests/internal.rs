@@ -179,6 +179,22 @@ struct FakeSession {
     grace_until: Option<Timestamp>,
 }
 
+/// What a reused refresh token of session `id` revokes (#311): every live session of that
+/// session's user in its project, the session itself included.
+fn revoke_user_live(sessions: &mut [FakeSession], id: uuid::Uuid, now: Timestamp) -> Vec<AppSession> {
+    let Some((project, user)) = sessions.iter().find(|f| f.s.id == id).map(|f| (f.s.project_id, f.s.user_id)) else {
+        return Vec::new();
+    };
+    sessions
+        .iter_mut()
+        .filter(|f| f.s.project_id == project && f.s.user_id == user && f.s.revoked_at.is_none())
+        .map(|f| {
+            f.s.revoked_at = Some(now);
+            f.s.clone()
+        })
+        .collect()
+}
+
 /// One endpoint's rows as the DDL receiver's transaction sees them.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct DdlState {
@@ -1002,14 +1018,10 @@ impl NeonMetadataPort for FakeNeon {
                     session: f.s.clone(),
                     sealed: sealed.clone(),
                 }),
-                _ => {
-                    f.s.revoked_at = Some(now);
-                    Ok(RefreshOutcome::Reused(f.s.clone()))
-                }
+                _ => Ok(RefreshOutcome::Reused(revoke_user_live(&mut app.sessions, id, now))),
             }
         } else if proof == RefreshProof::Issued {
-            f.s.revoked_at = Some(now);
-            Ok(RefreshOutcome::Reused(f.s.clone()))
+            Ok(RefreshOutcome::Reused(revoke_user_live(&mut app.sessions, id, now)))
         } else {
             Ok(RefreshOutcome::Invalid)
         }
@@ -5745,6 +5757,33 @@ async fn revokes_answer_before_identity_ends_the_sessions() {
     assert!(start.elapsed() < fast, "refresh reuse waited {:?}", start.elapsed());
     // That they still end, in the background, is `revoke_user_sessions_keeps_one` and the
     // other revoke tests.
+}
+
+// #311: a reused refresh token ends every session of its user in the project, and the identity
+// session behind each; another user's session stays.
+#[tokio::test]
+async fn refresh_reuse_revokes_every_session_of_the_user() {
+    let w = app_world();
+    let z = identity_with_sessions(w.project, &["z1", "z2", "z3"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (u, v) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (s1, t0) = a.create_session(w.project, u, z.id("z1")).await;
+    let (s2, t2) = a.create_session(w.project, u, z.id("z2")).await;
+    let (s3, t3) = a.create_session(w.project, v, z.id("z3")).await;
+    let (status, _) = a.refresh(w.project, &t0).await;
+    assert_eq!(status, 200);
+    a.edit_session(s1, |f| f.grace_until = Some(Timestamp::now() - chelabase_time::seconds(1)));
+    let (status, body) = a.refresh(w.project, &t0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"), "{body}");
+    assert!(a.revoked(s1) && a.revoked(s2));
+    assert!(!a.revoked(s3));
+    assert!(eventually(|| z.revoked().len() == 2).await, "{:?}", z.fake.calls());
+    assert_eq!(z.revoked(), ["z1", "z2"]);
+    // The other session's current token is refused; the other user's rotates.
+    let (status, body) = a.refresh(w.project, &t2).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
+    let (status, body) = a.refresh(w.project, &t3).await;
+    assert_eq!(status, 200, "{body}");
 }
 
 #[tokio::test]

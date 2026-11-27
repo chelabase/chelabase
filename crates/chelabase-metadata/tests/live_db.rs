@@ -6299,7 +6299,7 @@ async fn refresh_rotates_grace_and_reuse() {
     assert_eq!(g.revoked_at, None);
     assert_eq!(after_grace_check.revoked_at, None);
     let RefreshOutcome::Reused(u) = reused else { panic!("{reused:?}") };
-    assert!(u.revoked_at.is_some());
+    assert!(u.len() == 1 && u[0].revoked_at.is_some(), "{u:?}");
     assert_eq!(current, RefreshOutcome::Invalid, "a revoked session refuses even its current token");
     assert_eq!(stale, RefreshOutcome::Invalid, "a revoked session refuses an issued stale token");
     assert_eq!(stale_peek, PeekOutcome::Invalid);
@@ -6474,9 +6474,60 @@ async fn refresh_revokes_on_an_issued_stale_token() {
     let current = client.refresh_app_session(s.id, project, hash(3), Issued, &next(5, 60)).await.unwrap();
     cleanup_project(&client, project, &[]).await;
     let RefreshOutcome::Reused(u) = reused else { panic!("{reused:?}") };
-    assert_eq!(u.id, s.id);
-    assert!(u.revoked_at.is_some() && row.revoked_at.is_some());
+    assert_eq!(u.iter().map(|x| x.id).collect::<Vec<_>>(), vec![s.id]);
+    assert!(u[0].revoked_at.is_some() && row.revoked_at.is_some());
     assert_eq!(current, RefreshOutcome::Invalid);
+}
+
+// #311: a reused refresh token ends every live session of its user in the project, in the one
+// transaction, and nothing else: not another user's session, not the same user id in another
+// project. Sessions already revoked keep their time and aren't answered again.
+#[tokio::test]
+#[ignore]
+async fn reused_refresh_token_revokes_every_session_of_the_user() {
+    let client = client().await;
+    let project = new_project(&client, "reuse-user-wide").await;
+    let elsewhere = new_project(&client, "reuse-user-wide-other").await;
+    let (user, other_user) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let (s1, s2) = (new_session(project, user, 1), new_session(project, user, 10));
+    let gone = new_session(project, user, 20);
+    let theirs = new_session(project, other_user, 30);
+    let other_project = new_session(elsewhere, user, 40);
+    for s in [&s1, &s2, &gone, &theirs, &other_project] {
+        client.insert_app_session(s).await.unwrap();
+    }
+    client.revoke_app_session(gone.id, project).await.unwrap();
+    let gone_before = client.app_session(gone.id).await.unwrap().unwrap();
+    client.refresh_app_session(s1.id, project, hash(1), Issued, &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s1.id, project, hash(2), Issued, &next(3, 60)).await.unwrap();
+    // An unproven stale token is only `Invalid`: nothing of the user's ends.
+    let unproven = client.refresh_app_session(s1.id, project, hash(77), Unproven, &next(4, 60)).await.unwrap();
+    let live_after_unproven = client.list_user_sessions(project, user).await.unwrap().len();
+    let reused = client.refresh_app_session(s1.id, project, hash(1), Issued, &next(5, 60)).await.unwrap();
+    let mut rows = Vec::new();
+    for s in [&s1, &s2, &gone, &theirs, &other_project] {
+        rows.push(client.app_session(s.id).await.unwrap().unwrap());
+    }
+    let s2_current = client.refresh_app_session(s2.id, project, hash(10), Issued, &next(11, 60)).await.unwrap();
+    let theirs_current = client.refresh_app_session(theirs.id, project, hash(30), Issued, &next(31, 60)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    cleanup_project(&client, elsewhere, &[]).await;
+
+    assert_eq!(unproven, RefreshOutcome::Invalid);
+    assert_eq!(live_after_unproven, 2);
+    let RefreshOutcome::Reused(revoked) = reused else { panic!("{reused:?}") };
+    let mut ids: Vec<_> = revoked.iter().map(|s| s.id).collect();
+    ids.sort();
+    let mut expected = vec![s1.id, s2.id];
+    expected.sort();
+    assert_eq!(ids, expected, "the token's session and the user's other live one");
+    assert!(revoked.iter().all(|s| s.revoked_at.is_some() && s.user_id == user && s.project_id == project));
+    assert!(rows[0].revoked_at.is_some() && rows[1].revoked_at.is_some());
+    assert_eq!(rows[2], gone_before, "an already revoked session is left as it was");
+    assert_eq!(rows[3].revoked_at, None, "another user's session");
+    assert_eq!(rows[4].revoked_at, None, "the same user id in another project");
+    assert_eq!(s2_current, RefreshOutcome::Invalid, "the other session's current token is refused");
+    assert!(matches!(theirs_current, RefreshOutcome::Rotated(_)), "{theirs_current:?}");
 }
 
 // Peek answers `Reused` for the same token and leaves the session as it was.

@@ -197,8 +197,9 @@ pub enum RefreshOutcome {
     /// token, sealed.
     Grace { session: AppSession, sealed: String },
     /// The previous token after its grace, or a [`RefreshProof::Issued`] token that matches
-    /// neither the current nor the previous one: the session is now revoked.
-    Reused(AppSession),
+    /// neither the current nor the previous one. The sessions it revoked, in no order: the
+    /// token's, and every other live session of its user in its project.
+    Reused(Vec<AppSession>),
     /// Unknown session, another project's, revoked, expired, or a [`RefreshProof::Unproven`]
     /// token that matches neither.
     Invalid,
@@ -237,20 +238,30 @@ fn cap_reached(now: Timestamp, created_at: Timestamp, cap: Duration) -> bool {
     created_at.checked_add(cap).is_none_or(|end| now >= end)
 }
 
-/// Revokes the session locked in `tx` for a reused refresh token.
+/// A reused refresh token: revokes `session` (locked in `tx`, live) and every other live session
+/// of its user in its project (#311), and returns them. The project and user are the locked
+/// row's, never the caller's, so only that user's sessions end.
+///
+/// Lock order: the transaction holds the token's session row and then takes the user's other
+/// rows. Two of these for one user at once, or one beside
+/// [`MetadataClient::revoke_user_sessions`], can deadlock; Postgres then aborts one, its caller
+/// gets the error, and the one that commits has revoked every session all the same. A rotation
+/// holds only its own row, so it only waits.
 async fn revoke_reused(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    id: Uuid,
+    session: &AppSession,
 ) -> Result<RefreshOutcome, MetadataError> {
-    let row = sqlx::query(
-        "UPDATE app_sessions SET revoked_at = now() WHERE id = $1
+    let rows = sqlx::query(
+        "UPDATE app_sessions SET revoked_at = now()
+         WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NULL
          RETURNING id, project_id, user_id, identity_session_id, created_at,
                    last_used_at, expires_at, revoked_at",
     )
-    .bind(id)
-    .fetch_one(&mut **tx)
+    .bind(session.project_id.as_uuid())
+    .bind(session.user_id)
+    .fetch_all(&mut **tx)
     .await?;
-    Ok(RefreshOutcome::Reused(session_from_row(&row)))
+    Ok(RefreshOutcome::Reused(rows.iter().map(session_from_row).collect()))
 }
 
 fn auth_from_row(r: &PgRow) -> Result<ProjectAuth, MetadataError> {
@@ -687,9 +698,10 @@ impl MetadataClient {
     /// Unknown, another project's or revoked sessions are `Invalid` and nothing is written. A
     /// session past its expiry or its `cap` is revoked and `Invalid`. The current token rotates
     /// (`Rotated`); the previous one gets the new sealed token within the grace (`Grace`, no
-    /// change) and revokes the session after it (`Reused`). Any other token revokes the session
-    /// (`Reused`) when `proof` is [`RefreshProof::Issued`], and is `Invalid` and changes nothing
-    /// when it is [`RefreshProof::Unproven`].
+    /// change) and is reuse after it (`Reused`). Any other token is reuse (`Reused`) when `proof`
+    /// is [`RefreshProof::Issued`], and is `Invalid` and changes nothing when it is
+    /// [`RefreshProof::Unproven`]. Reuse revokes the session and every other live session of its
+    /// user in its project, in this transaction (`revoke_reused`).
     pub async fn refresh_app_session(
         &self,
         id: Uuid,
@@ -752,11 +764,11 @@ impl MetadataClient {
             let sealed: Option<String> = row.get("grace_refresh_sealed");
             match (grace_until, sealed) {
                 (Some(until), Some(sealed)) if until > now => RefreshOutcome::Grace { session, sealed },
-                _ => revoke_reused(&mut tx, id).await?,
+                _ => revoke_reused(&mut tx, &session).await?,
             }
         } else {
             match proof {
-                RefreshProof::Issued => revoke_reused(&mut tx, id).await?,
+                RefreshProof::Issued => revoke_reused(&mut tx, &session).await?,
                 RefreshProof::Unproven => RefreshOutcome::Invalid,
             }
         };

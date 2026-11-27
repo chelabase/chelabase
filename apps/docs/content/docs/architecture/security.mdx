@@ -23,7 +23,7 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **Sessions are reset between requests.** A pooled connection starts every request as the `authenticator` role with default settings, so a function that changes the session cannot leak into another request.
 
-**App users.** Access tokens are short-lived, signed by `auth` and checked by the gateway together with a session-liveness check. Refresh tokens rotate on every use, only their SHA-256 is stored, and presenting an old one after a short grace window revokes the session. See [App users](/architecture/app-users).
+**App users.** Access tokens are short-lived, signed by `auth` and checked by the gateway together with a session-liveness check. Refresh tokens rotate on every use, only their SHA-256 is stored, and presenting an old one after a short grace window revokes every session of the user. See [App users](/architecture/app-users).
 
 **Sign-in cookies.** The login API keeps the session and the step state in encrypted, `HttpOnly`, `SameSite=Strict` cookies scoped to `/auth/v1` (`Secure` under https). Only Studio can turn the session into a token: `/auth/v1/token` requires Studio's `Origin` and `X-Chelabase-Studio: 1`. Answers are padded to a minimum response time (1.5 s by default) and rate limited; a wrong password, an unknown email and no active membership answer alike. Per-address limits treat an IPv6 address as its /64, and failed sign-ins from one client don't lock the account for its owner signing in from another.
 

@@ -45,6 +45,8 @@ struct Held {
     pattern: String,
     started: tokio::sync::mpsc::UnboundedSender<()>,
     release: Arc<tokio::sync::Semaphore>,
+    /// Held once the fake has answered (its work is done), not before the call reaches it.
+    after: bool,
 }
 
 #[derive(Default)]
@@ -98,7 +100,7 @@ async fn proxy_handle(
             .held
             .as_ref()
             .filter(|h| call.contains(h.pattern.as_str()))
-            .map(|h| (h.started.clone(), h.release.clone()));
+            .map(|h| (h.started.clone(), h.release.clone(), h.after));
         (hooks, raw, delay, held)
     };
     for hook in hooks {
@@ -107,7 +109,8 @@ async fn proxy_handle(
     if let Some(d) = delay {
         tokio::time::sleep(d).await;
     }
-    if let Some((started, release)) = held {
+    let held_after = held.as_ref().is_some_and(|h| h.2);
+    if let Some((started, release, false)) = &held {
         let _ = started.send(());
         release.acquire().await.unwrap().forget();
     }
@@ -124,6 +127,10 @@ async fn proxy_handle(
     let answer = forward.body(bytes).send().await.unwrap();
     let status = answer.status();
     let body = answer.bytes().await.unwrap();
+    if let Some((started, release, _)) = held.filter(|_| held_after) {
+        let _ = started.send(());
+        release.acquire().await.unwrap().forget();
+    }
     (status, [("content-type", "application/json")], body).into_response()
 }
 
@@ -171,12 +178,23 @@ impl Proxy {
 
     /// Holds each call matching `pattern` until released.
     fn hold(&self, pattern: &str) -> HoldHandle {
+        self.hold_at(pattern, false)
+    }
+
+    /// Holds the answer of each call matching `pattern` until released: the fake has done the
+    /// call's work already.
+    fn hold_answer(&self, pattern: &str) -> HoldHandle {
+        self.hold_at(pattern, true)
+    }
+
+    fn hold_at(&self, pattern: &str, after: bool) -> HoldHandle {
         let (started, rx) = tokio::sync::mpsc::unbounded_channel();
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         self.state.lock().unwrap().held = Some(Held {
             pattern: pattern.into(),
             started,
             release: release.clone(),
+            after,
         });
         HoldHandle {
             rx,
@@ -2594,6 +2612,192 @@ async fn change_email_without_verification_applies_at_once_behind_the_password()
     let a = h.change_email("ada@third.example", access(&s)).await;
     assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
     assert_eq!(h.user(&id).await.unwrap().email, "ada@third.example");
+}
+
+// ---- #311: an email change ends the user's other sessions --------------------------------------
+
+impl H {
+    fn user_revokes(&self, user: &str) -> Vec<Value> {
+        self.internal.bodies(&format!("POST /internal/app/users/{user}/revoke-sessions"))
+    }
+
+    /// Whether identity was asked to end every session of `user` (the caller's included).
+    fn identity_ended_all(&self, user: &str) -> bool {
+        self.proxy.calls().contains(&format!("DELETE {}/users/{user}/sessions", self.pool_path()))
+    }
+
+    async fn refresh_with(&self, session: &Ans) -> Ans {
+        self.post("refresh", json!({"refresh_token": session.body["refresh_token"]}), None).await
+    }
+
+    /// AC 1's checks after `s1` changed the email of `id` to `email`: `s2` is ended, `s1` and
+    /// another user's session `bob` go on.
+    async fn assert_only_other_sessions_ended(&self, id: &str, email: &str, s1: &Ans, s2: &Ans, bob: &Ans) {
+        let (sid1, sid2) = (self.session_id(s1), self.session_id(s2));
+        // One revoke, of this user in this project, keeping exactly the caller's session.
+        assert_eq!(self.user_revokes(id), vec![json!({"project_id": self.project, "keep_session_id": sid1})]);
+        assert!(self.internal.session(sid2).unwrap().revoked);
+        assert!(!self.internal.session(sid1).unwrap().revoked);
+        assert!(!self.internal.session(self.session_id(bob)).unwrap().revoked);
+        // The caller's identity session is left: the orchestrator ends the ones behind the
+        // revoked app sessions, and nothing ends them all.
+        assert!(!self.identity_ended_all(id), "{:?}", self.proxy.calls());
+        assert!(self.identity_session_live(&self.identity_session(sid1)).await);
+        let r = self.refresh_with(s2).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+        let r = self.refresh_with(s1).await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        assert_eq!(self.claims(access(&r)).email, email);
+        assert_eq!(self.refresh_with(bob).await.status, StatusCode::OK);
+    }
+}
+
+/// #311 AC 1, verification off: the change is made at once, and the user's other sessions end.
+#[tokio::test]
+async fn email_change_ends_other_sessions() {
+    let h = harness().await;
+    let id = h.add_user("ada@example.com", true).await;
+    h.add_user("bob@example.com", true).await;
+    let s1 = h.sign_in("ada@example.com", PW).await;
+    let s2 = h.sign_in("ada@example.com", PW).await;
+    let bob = h.sign_in("bob@example.com", PW).await;
+    let a = h.change_email("ada@new.example", access(&s1)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    h.assert_only_other_sessions_ended(&id, "ada@new.example", &s1, &s2, &bob).await;
+}
+
+/// #311 AC 1, verification on: asking for the code ends nothing; confirming it ends the user's
+/// other sessions.
+#[tokio::test]
+async fn confirmed_email_change_ends_other_sessions() {
+    let h = harness_opts(true, 1, true).await;
+    let id = h.add_user("ada@example.com", true).await;
+    h.add_user("bob@example.com", true).await;
+    let s1 = h.sign_in("ada@example.com", PW).await;
+    let s2 = h.sign_in("ada@example.com", PW).await;
+    let bob = h.sign_in("bob@example.com", PW).await;
+    assert_eq!(h.change_email("ada@new.example", access(&s1)).await.status, StatusCode::ACCEPTED);
+    assert!(h.user_revokes(&id).is_empty(), "nothing changed yet");
+    let sent = h.email_change_codes().pop().unwrap().2;
+    let a = h.confirm_email_change("ada@new.example", &sent, access(&s1)).await;
+    assert_eq!(a.status, StatusCode::NO_CONTENT, "{}", a.body);
+    h.assert_only_other_sessions_ended(&id, "ada@new.example", &s1, &s2, &bob).await;
+}
+
+/// #311 AC 4: an email change that is refused, or only asks for the code, revokes nothing.
+#[tokio::test]
+async fn failed_email_change_revokes_nothing() {
+    for verification in [false, true] {
+        let h = harness_opts(verification, 1, true).await;
+        let id = h.add_user("ada@example.com", true).await;
+        h.add_user("bob@example.com", true).await;
+        let s1 = h.sign_in("ada@example.com", PW).await;
+        let s2 = h.sign_in("ada@example.com", PW).await;
+        let wrong = json!({"email": "ada@new.example", "current_password": "Wr0ng!pass"});
+        let a = h.post("change-email", wrong, Some(access(&s1))).await;
+        assert_eq!(code(&a), "invalid_credentials", "{}", a.body);
+        let a = h.change_email("bob@example.com", access(&s1)).await;
+        assert_eq!(code(&a), "email_taken", "{}", a.body);
+        let a = h.change_email("ada@example.com", access(&s1)).await;
+        assert_eq!(code(&a), "conflict", "{}", a.body);
+        let a = h.change_email("not an email", access(&s1)).await;
+        assert_eq!(code(&a), "invalid_request", "{}", a.body);
+        if verification {
+            // The code is asked for (202), then guessed wrong, then the address is taken.
+            assert_eq!(h.change_email("ada@new.example", access(&s1)).await.status, StatusCode::ACCEPTED);
+            let sent = h.email_change_codes().pop().unwrap().2;
+            let guess = if sent == "000000" { "111111" } else { "000000" };
+            let a = h.confirm_email_change("ada@new.example", guess, access(&s1)).await;
+            assert_eq!(code(&a), "invalid_code", "{}", a.body);
+            h.add_user("ada@new.example", true).await;
+            let a = h.confirm_email_change("ada@new.example", &sent, access(&s1)).await;
+            assert_eq!(code(&a), "email_taken", "{}", a.body);
+        } else {
+            // Identity refuses the write.
+            h.proxy.refuse(&format!("PUT {}/users/{id}/email", h.pool_path()), 503, "internal", 1);
+            let a = h.change_email("ada@new.example", access(&s1)).await;
+            assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
+        }
+        assert_eq!(h.user(&id).await.unwrap().email, "ada@example.com", "verification {verification}");
+        assert!(h.user_revokes(&id).is_empty(), "verification {verification}");
+        assert!(!h.identity_ended_all(&id));
+        for s in [&s1, &s2] {
+            assert!(!h.internal.session(h.session_id(s)).unwrap().revoked);
+            assert_eq!(h.refresh_with(s).await.status, StatusCode::OK, "verification {verification}");
+        }
+        // Only the two signed-in identity sessions: every password check's was ended.
+        assert_eq!(h.fake.session_count(&h.pool()), 2, "verification {verification}");
+    }
+}
+
+/// #311: when the other sessions can't be revoked after the change, the answer is 503 (the
+/// address is changed and synced; a retry answers 409 or `invalid_code`), never a silent 204.
+#[tokio::test]
+async fn email_change_answers_503_when_the_other_sessions_cannot_be_revoked() {
+    for verification in [false, true] {
+        let h = harness_opts(verification, 1, true).await;
+        let id = h.add_user("ada@example.com", true).await;
+        let s1 = h.sign_in("ada@example.com", PW).await;
+        let revoke = format!("POST /internal/app/users/{id}/revoke-sessions");
+        let a = if verification {
+            assert_eq!(h.change_email("ada@new.example", access(&s1)).await.status, StatusCode::ACCEPTED);
+            let sent = h.email_change_codes().pop().unwrap().2;
+            h.iproxy.answer_raw(&revoke, 503, "", 1);
+            h.confirm_email_change("ada@new.example", &sent, access(&s1)).await
+        } else {
+            h.iproxy.answer_raw(&revoke, 503, "", 1);
+            h.change_email("ada@new.example", access(&s1)).await
+        };
+        assert_eq!((a.status, code(&a)), (StatusCode::SERVICE_UNAVAILABLE, "unavailable"), "{}", a.body);
+        assert_eq!(h.user(&id).await.unwrap().email, "ada@new.example");
+        assert_eq!(h.internal.bodies("POST /internal/app/sync").len(), 1, "the change is synced");
+        assert_eq!(h.refresh_with(&s1).await.status, StatusCode::OK, "the caller's session goes on");
+    }
+}
+
+/// #311 AC 3: a change-email or change-password request dropped while identity checks the
+/// current password leaves no identity session behind: the check's session, which identity
+/// made before the client hung up, is ended all the same. Nothing else changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_password_check_leaves_no_identity_session() {
+    let cases = [
+        ("change-email", json!({"email": "ada@new.example", "current_password": PW})),
+        ("change-password", json!({"current_password": PW, "password": NEW_PW})),
+    ];
+    for (path, body) in cases {
+        let h = harness().await;
+        let id = h.add_user("ada@example.com", true).await;
+        let s = h.sign_in("ada@example.com", PW).await;
+        assert_eq!(h.fake.session_count(&h.pool()), 1);
+        // Identity has made the check's session; its answer is held until the client is gone.
+        let mut hold = h.proxy.hold_answer(&h.sign_in_call());
+        let send = h
+            .http
+            .post(format!("{}/auth/v1/app/{path}", h.base))
+            .header(IDENTITY_HEADER, h.identity_for(Some(access(&s)), DataKeyKind::Public))
+            .json(&body)
+            .send();
+        tokio::select! {
+            r = send => panic!("{path}: answered before the password check came back: {r:?}"),
+            () = hold.started() => {}
+        }
+        assert_eq!(h.fake.session_count(&h.pool()), 2, "{path}: the check's session exists");
+        // The request was dropped with the select; give the server time to see the hang-up.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        hold.release();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while h.fake.session_count(&h.pool()) != 1 {
+            assert!(Instant::now() < deadline, "{path}: the check's identity session was left behind");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(hold);
+        h.proxy.clear();
+        assert!(h.identity_session_live(&h.identity_session(h.session_id(&s))).await, "{path}");
+        let u = h.user(&id).await.unwrap();
+        assert_eq!(u.email, "ada@example.com", "{path}");
+        assert!(h.password_is("ada@example.com", PW).await, "{path}");
+        assert!(h.user_revokes(&id).is_empty(), "{path}");
+    }
 }
 
 #[tokio::test]

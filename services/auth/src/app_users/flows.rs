@@ -269,12 +269,12 @@ async fn app_sign_in(
     path = "/auth/v1/app/refresh",
     operation_id = "appRefresh",
     tag = TAG,
-    description = "Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later revokes the session).",
+    description = "Exchanges a refresh token for a new session. The old refresh token stops working (presenting it again later ends every session of the user).",
     request_body = AppRefreshBody,
     responses(
         (status = 200, description = "The new session", body = SessionResponse),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
-        (status = 401, description = "The refresh token is invalid (`refresh_token_invalid`) or was used already (`refresh_token_reused`; the session is revoked), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
+        (status = 401, description = "The refresh token is invalid (`refresh_token_invalid`) or was used already (`refresh_token_reused`; every session of the user is revoked), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
         (status = 403, description = "The user is deactivated or locked: `user_inactive`", body = ErrorEnvelope),
         (status = 409, description = "App users are off: `app_users_disabled`", body = ErrorEnvelope),
         (status = 413, description = "The body is too large: `too_large`", body = ErrorEnvelope),
@@ -473,7 +473,7 @@ async fn app_password_reset_confirm(
     path = "/auth/v1/app/change-email",
     operation_id = "appChangeEmail",
     tag = TAG,
-    description = "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies.",
+    description = "Changes the signed-in user's email (needs the `Chelabase-User` token and the current password). With email verification on, a code is mailed to the new address and the account keeps its current address until `change-email/confirm`; with it off, the new address applies at once. Either way the previous address is told when the change applies, and every other session of the user ends.",
     request_body = AppChangeEmailBody,
     responses(
         (status = 202, description = "Verification is on: a code went to the new address; nothing changed yet", body = EmailChangePending),
@@ -506,7 +506,7 @@ async fn app_change_email(
     path = "/auth/v1/app/change-email/confirm",
     operation_id = "appConfirmEmailChange",
     tag = TAG,
-    description = "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, and the previous address is told.",
+    description = "Finishes the signed-in user's pending email change (needs the `Chelabase-User` token) with the code mailed to the new address: the email becomes that address, verified, the previous address is told, and every other session of the user ends.",
     request_body = AppChangeEmailConfirmBody,
     responses(
         (status = 204, description = "Changed"),
@@ -811,6 +811,52 @@ async fn end_identity_session(s: &AppState, pool: &Pool, session_id: &str) {
         Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
         Err(e) => warn!(error = %e, "ending an identity session failed"),
     }
+}
+
+/// Checks a user's current password with an identity sign-in and ends the session that sign-in
+/// made, whatever the verdict's caller does next: the answer is the sign-in's, its session
+/// already ended.
+///
+/// The two calls run as their own task. A request dropped mid-way (the client hung up) drops
+/// its future, and identity may have made the session by then; the task still ends it, so no
+/// identity session of the user outlives a cancelled check (#311).
+async fn check_password(s: &AppState, pool: &Pool, email: &str, password: &str) -> Result<SignedIn, IdentityError> {
+    let identity = s.identity.clone();
+    let (pool, email, password) = (*pool, email.to_string(), password.to_string());
+    let task = tokio::spawn(async move {
+        let signed = identity.sign_in(&pool, &email, &password).await?;
+        match identity.revoke_session(&pool, &signed.session_id).await {
+            Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
+            Err(e) => warn!(error = %e, "ending a password check's identity session failed"),
+        }
+        Ok(signed)
+    });
+    task.await.unwrap_or_else(|e| {
+        warn!(error = %e, "the password check task failed");
+        Err(IdentityError::Unavailable(e.to_string()))
+    })
+}
+
+/// Ends every other app session of the user after an email change, and the identity session
+/// behind each (the orchestrator ends those); the caller's session `keep` and its identity
+/// session go on. A failure is 503: the address is changed already, and a retry of the change
+/// can't redo this (it answers 409, or `invalid_code` for a spent code), so it is never
+/// answered as done (#311).
+async fn end_other_sessions(app: &AppUsers, info: &AppBranchInfo, user: Uuid, keep: Uuid) -> Flow<()> {
+    app.internal
+        .revoke_user_sessions(
+            user,
+            &RevokeUserSessions {
+                project_id: info.project_id,
+                keep_session_id: Some(keep),
+                created_before: None,
+            },
+        )
+        .await
+        .map_err(|e| {
+            warn!(error = %e, user = %user, "the email changed but the user's other sessions were not ended");
+            unavailable()
+        })
 }
 
 /// With the password checked (`signed`, a new identity session): the user's state, then the
@@ -1185,14 +1231,16 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
 ///   into reuse (#59 audit B1). A fault after that answers 503; the client keeps a grace
 ///   token, which works again only until its grace ends.
 /// - A peek verdict goes on to `refresh`, so the orchestrator applies its own rules (it
-///   revokes on reuse); a session that `refresh` names but peek didn't check is checked after.
+///   revokes on reuse, and then every session of the user: #311); a session that `refresh`
+///   names but peek didn't check is checked after.
 ///
 /// A request that peeked a current token just before a parallel one rotated it reaches
 /// `refresh` holding a grace token. [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP) caps
 /// the lookup at half of [`APP_REFRESH_GRACE`](chelabase_auth::app_token::APP_REFRESH_GRACE)
 /// or less, so it gets the grace answer provided the peek's reply, the `refresh` call and its
 /// row lock take under the rest. If they take longer, the grace has ended: `refresh` answers
-/// `refresh_token_reused` and revokes the session, an accepted residual (#59 second audit).
+/// `refresh_token_reused` and revokes the user's sessions, an accepted residual (#59 second
+/// audit; all of the user's sessions since #311).
 /// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
 /// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
@@ -1515,15 +1563,17 @@ async fn password_reset_confirm(
 ///
 /// 1. rate limits, the address's shape, the branch;
 /// 2. the current password, checked with an identity sign-in against the current address. The
-///    check's identity session is ended at once, whatever comes next;
+///    check's identity session is ended at once, whatever comes next, a dropped request
+///    included ([`check_password`]);
 /// 3. an address another user holds is 409 `email_taken`, the user's own 409 `conflict`;
 /// 4. verification on: a code goes to the new address (within [`reserve_code_issue`]; 429
 ///    while a code sent under a minute ago stands) and the answer is 202 with nothing changed;
 ///    `change-email/confirm` makes the change. Verification off: the address is set, verified,
-///    the previous address is told, and the change is synced.
+///    the previous address is told, the change is synced, and the user's other sessions end
+///    ([`end_other_sessions`]).
 ///
-/// Sessions continue. Nothing is written before step 4, so any refusal changes nothing. A lost
-/// sync is the reconcile's.
+/// The caller's session continues. Nothing is written and no session ends before step 4, so
+/// any refusal changes nothing. A lost sync is the reconcile's.
 async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -> Flow {
     let app = app(s);
     let Some(claims) = &caller.user else {
@@ -1553,13 +1603,9 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
         Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
         Err(e) => return Err(identity_down(&e)),
     };
-    match s.identity.sign_in(&pool, &current.email, &b.current_password).await {
-        Ok(signed) => {
-            end_identity_session(s, &pool, &signed.session_id).await;
-            if signed.user.id != sub {
-                return Err(refused());
-            }
-        }
+    match check_password(s, &pool, &current.email, &b.current_password).await {
+        Ok(signed) if signed.user.id == sub => {}
+        Ok(_) => return Err(refused()),
         Err(IdentityError::BadCredentials | IdentityError::Banned | IdentityError::Invalid { .. }) => {
             return Err(refused());
         }
@@ -1606,6 +1652,7 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppChangeEmailBody) -
         },
     )
     .await;
+    end_other_sessions(app, &info, claims.sub, claims.sid).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1631,7 +1678,8 @@ fn email_write_refused(e: IdentityError) -> ApiError {
 /// Finishes a pending email change for the token's user (never one named in the body): the
 /// code must have been mailed to `email` for this user, while their current address is the one
 /// it was issued under. Identity swaps the address in, verified, and tells the previous one;
-/// then the change is synced.
+/// then the change is synced and the user's other sessions end ([`end_other_sessions`]). A
+/// refused code changes nothing and ends no session.
 async fn change_email_confirm(
     s: &AppState,
     caller: &AppCaller,
@@ -1685,14 +1733,15 @@ async fn change_email_confirm(
         },
     )
     .await;
+    end_other_sessions(app, &info, claims.sub, claims.sid).await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Changes the password and returns a new session; every other session ends. In order:
 ///
-/// 1. the current password is checked with an identity sign-in;
-/// 2. `set_password`. A failure up to here changes nothing (the check's identity session is
-///    ended), and a retry works;
+/// 1. the current password is checked with an identity sign-in, whose session is ended at
+///    once, a dropped request included ([`check_password`]);
+/// 2. `set_password`. A failure up to here changes nothing, and a retry works;
 /// 3. the user's sessions end in both stores, identity's then the app sessions, each attempted
 ///    whatever the other did. Either alone refuses every old refresh token: a revoked app
 ///    session directly, one whose identity session is gone at its next refresh. Only when both
@@ -1731,20 +1780,16 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         return Err(fail(403, ErrorCode::EmailNotVerified, text::NOT_VERIFIED));
     }
     // 1.
-    let check = match s.identity.sign_in(&pool, &current.email, &b.current_password).await {
-        Ok(signed) if signed.user.id == sub => signed,
-        Ok(signed) => {
-            end_identity_session(s, &pool, &signed.session_id).await;
-            return Err(refused());
-        }
+    match check_password(s, &pool, &current.email, &b.current_password).await {
+        Ok(signed) if signed.user.id == sub => {}
+        Ok(_) => return Err(refused()),
         Err(IdentityError::BadCredentials | IdentityError::Banned | IdentityError::Invalid { .. }) => {
             return Err(refused());
         }
         Err(e) => return Err(identity_down(&e)),
-    };
+    }
     // 2.
     if let Err(e) = s.identity.set_password(&pool, &sub, &b.password).await {
-        end_identity_session(s, &pool, &check.session_id).await;
         return Err(match e {
             e if is_weak(&e) => weak_password(),
             IdentityError::NotFound(Missing::User) => no_user(),
