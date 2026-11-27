@@ -9,7 +9,9 @@
 //! of `calls` in turn to the host's callback for the run's exec_id (or `exec_id`), waits
 //! `pause_ms`, drops the detached calls still in flight when `abort` is set (as workerd does
 //! once the code settles), and answers the run: with `{"answers": [{"http": host status,
-//! "answer": host body}, …]}`, with a `threw` error for `throw`, or never for `hang`.
+//! "answer": host body}, …]}`, with a `threw` error for `throw`, or never for `hang`. Like the
+//! runner, it numbers the calls (the detached ones first) in a `chelabase-call` header, and
+//! reports a script's `"unreceived": [n, …]` as the calls whose answer the code never got.
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -226,16 +228,19 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
         "{}/internal/exec/{target}/request",
         stub.internal.lock().unwrap()
     );
+    let mut number = 0u32;
     let detached: Vec<_> = script["detached"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .into_iter()
         .map(|call| {
+            number += 1;
             let request = stub
                 .http
                 .post(&url)
                 .header("content-type", "application/json")
+                .header("chelabase-call", number.to_string())
                 .body(call.to_string());
             tokio::spawn(async move {
                 let _ = request.send().await;
@@ -255,10 +260,12 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
             Some(raw) => raw.to_owned(),
             None => call.to_string(),
         };
+        number += 1;
         let resp = stub
             .http
             .post(&url)
             .header("content-type", "application/json")
+            .header("chelabase-call", number.to_string())
             .body(body)
             .send()
             .await
@@ -277,22 +284,24 @@ async fn runtime_run(State(stub): State<Arc<RuntimeStub>>, Json(job): Json<Value
             call.abort();
         }
     }
-    match script["then"].as_str() {
-        Some("hang") => std::future::pending::<Response>().await,
-        Some("runner_timeout") => Json(json!({
+    let mut answer = match script["then"].as_str() {
+        Some("hang") => std::future::pending::<Value>().await,
+        Some("runner_timeout") => json!({
             "ok": false,
             "error": {"code": "timeout", "message": "the runner's time is up"},
             "logs": [],
-        }))
-        .into_response(),
-        Some("throw") => Json(json!({
+        }),
+        Some("throw") => json!({
             "ok": false,
             "error": {"code": "threw", "message": "thrown by the code"},
             "logs": [],
-        }))
-        .into_response(),
-        _ => Json(json!({"ok": true, "result": {"answers": answers}, "logs": []})).into_response(),
+        }),
+        _ => json!({"ok": true, "result": {"answers": answers}, "logs": []}),
+    };
+    if let Some(unreceived) = script.get("unreceived") {
+        answer["unreceived"] = unreceived.clone();
     }
+    Json(answer).into_response()
 }
 
 async fn start_runtime() -> (String, Arc<RuntimeStub>) {
@@ -1927,6 +1936,87 @@ async fn a_call_after_the_deadline_then_a_throw_is_a_timeout_listing_calls() {
         json!([{"operation": "listProjects", "status": 200}]),
         "{result}"
     );
+}
+
+/// A call the host answered whose answer the runner never handed to the code (an un-awaited
+/// call cut when the code settled, or an answer that failed on its way back) is `unknown`.
+#[tokio::test]
+async fn a_call_the_runner_reports_unreceived_is_unknown() {
+    let h = Harness::start().await;
+    h.respond(matrix_gateway);
+    let result = h
+        .execute(json!({
+            "calls": [get("/v1/projects"), get("/v1/teams")],
+            "unreceived": [2],
+        }))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "calls_unfinished", "{result}");
+    assert_eq!(
+        error["calls"],
+        json!([
+            {"operation": "listProjects", "status": 200},
+            {"operation": "listTeams", "status": "unknown"},
+        ]),
+        "{result}"
+    );
+    // The host did answer it: its audit line has its real status.
+    let lines = run_lines(&h);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("listTeams") && l.contains("status=403")),
+        "{lines:?}"
+    );
+}
+
+/// The same when the code then threw: the error lists the call as `unknown`.
+#[tokio::test]
+async fn an_unreceived_call_then_a_throw_lists_it_unknown() {
+    let h = Harness::start().await;
+    // The detached SQL call is answered at once: only the runner knows the code never got it.
+    h.respond(|seen| match seen.uri.path() {
+        "/v1/projects" => Reply::json(200, json!([])),
+        _ => Reply::json(200, json!({"rows": []})),
+    });
+    let result = h
+        .execute_destructive(json!({
+            "detached": [call("POST", &format!("{BRANCH}/sql"), json!({"sql": "insert into t values (1)"}))],
+            "calls": [get("/v1/projects")],
+            "pause_ms": 250,
+            "unreceived": [1],
+            "then": "throw",
+        }))
+        .await;
+    let error = tool_error(&result);
+    assert_eq!(error["code"], "threw", "{result}");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("may have been applied"), "{result}");
+    let mut calls = error["calls"].as_array().unwrap().clone();
+    calls.sort_by_key(|c| c["operation"].as_str().unwrap().to_owned());
+    assert_eq!(
+        calls,
+        vec![
+            json!({"operation": "listProjects", "status": 200}),
+            json!({"operation": "runSql", "status": "unknown"}),
+        ],
+        "{result}"
+    );
+}
+
+/// Numbers the runner reports that name no forwarded call (a refused one) change nothing.
+#[tokio::test]
+async fn an_unreceived_refused_call_changes_nothing() {
+    let h = Harness::start().await;
+    h.respond(matrix_gateway);
+    let result = h
+        .execute(json!({
+            "calls": [get("/v1/nope"), get("/v1/projects")],
+            "unreceived": [1, 7],
+        }))
+        .await;
+    let answers = answers(&result);
+    assert_eq!(answers.len(), 2, "{result}");
 }
 
 #[tokio::test]

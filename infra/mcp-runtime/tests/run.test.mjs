@@ -114,6 +114,89 @@ describe("mcp runtime /run", () => {
     assert.equal(sent.headers.cookie, undefined);
   });
 
+  test("execute reports the calls whose answer the code never got", async () => {
+    const reply = host.reply;
+    try {
+      // Awaited calls got their answers: none is reported. Each call carries its number.
+      host.requests.length = 0;
+      const awaited = `async () => {
+        await chelabase.request({ method: "GET", path: "/v1/a" });
+        await chelabase.request({ method: "GET", path: "/v1/b" });
+        return 1;
+      }`;
+      const first = await runCode(rt, job(awaited, { kind: "execute", host }));
+      assert.equal(first.body.ok, true, JSON.stringify(first.body));
+      assert.deepEqual(first.body.unreceived, []);
+      assert.deepEqual(host.requests.map((q) => q.headers["chelabase-call"]), ["1", "2"]);
+
+      // An un-awaited call the host is still answering when the code returns.
+      host.requests.length = 0;
+      host.replyDelayMs = 1000;
+      const detached = `async () => {
+        chelabase.request({ method: "POST", path: "/v1/x", body: { a: 1 } });
+        await new Promise((r) => setTimeout(r, 200));
+        return 2;
+      }`;
+      const second = await runCode(rt, job(detached, { kind: "execute", host }));
+      assert.equal(second.body.ok, true, JSON.stringify(second.body));
+      assert.equal(second.body.result, 2);
+      assert.deepEqual(second.body.unreceived, [1]);
+      assert.equal(host.requests.length, 1, "the host received the call");
+
+      // An answer that reached the runner but that the runner hadn't read when the code
+      // settled: the host answers during the busy loop, which keeps the runner from reading.
+      host.requests.length = 0;
+      host.replyDelayMs = 50;
+      const busy = `async () => {
+        chelabase.request({ method: "POST", path: "/v1/x", body: { a: 1 } });
+        await new Promise((r) => setTimeout(r, 20));
+        const end = Date.now() + 400;
+        while (Date.now() < end) {}
+        return 3;
+      }`;
+      const busied = await runCode(rt, job(busy, { kind: "execute", host }));
+      assert.equal(busied.body.ok, true, JSON.stringify(busied.body));
+      assert.equal(busied.body.result, 3);
+      assert.deepEqual(busied.body.unreceived, [1]);
+      assert.equal(host.requests.length, 1, "the host received the call");
+      host.replyDelayMs = 0;
+
+      // An answer the runner can't read: the code gets a throw, and the call is reported,
+      // also when the code itself then throws.
+      host.reply = () => ({ not: "an answer" });
+      const unread = `async () => {
+        const e = await chelabase.request({ method: "GET", path: "/v1/a" }).then(() => "read", (e) => e.message);
+        await chelabase.request({ method: "GET", path: "/v1/b" }).catch(() => {});
+        if (e === "read") return e;
+        throw new Error(e);
+      }`;
+      const third = await runCode(rt, job(unread, { kind: "execute", host }));
+      assert.equal(third.body.ok, false, JSON.stringify(third.body));
+      assert.equal(third.body.error.code, "threw");
+      assert.deepEqual(third.body.unreceived, [1, 2]);
+
+      // A run that times out reports its call in flight.
+      host.reply = reply;
+      host.replyDelayMs = 5000;
+      const hung = `async () => chelabase.request({ method: "GET", path: "/v1/a" })`;
+      const hungJob = job(hung, { kind: "execute", host, timeout_ms: 500 });
+      const pending = runCode(rt, hungJob);
+      await new Promise((r) => setTimeout(r, 100));
+      // Its exec_id is taken while it runs.
+      assert.equal((await runCode(rt, { ...hungJob, code: "async () => 1" })).status, 409);
+      const fourth = await pending;
+      assert.equal(fourth.body.error?.code, "timeout", JSON.stringify(fourth.body));
+      assert.deepEqual(fourth.body.unreceived, [1]);
+
+      // Search runs make no calls and report none.
+      const search = await runCode(rt, job("async () => 1", { host }));
+      assert.equal(search.body.unreceived, undefined);
+    } finally {
+      host.reply = reply;
+      host.replyDelayMs = 0;
+    }
+  });
+
   test("a run cannot see an earlier run's globals", async () => {
     const first = await runCode(rt, job(`async () => { globalThis.leak = 42; spec.paths.added = 1; return "set" }`, { host }));
     assert.equal(first.body.result, "set");
