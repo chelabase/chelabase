@@ -60,7 +60,8 @@
 //!    - *upstream-unavailable*: the host handed the code `upstream_unavailable` (the API's
 //!      connection failed; the call may or may not have run);
 //!    - *unanswered*: the code never got its outcome (cut at the deadline or the run's end,
-//!      its handler dropped, or its answer never reached the code). It may have been applied.
+//!      its handler dropped, or the runner never handed its answer back). It may have been
+//!      applied.
 //!
 //!    The entry is marked answered when the handler hands its answer back, the last
 //!    synchronous step on the host; a call answered `timeout` stays unanswered. The answer can
@@ -68,7 +69,11 @@
 //!    call's answer, or the answer fails on its way to the runner. The runner numbers each
 //!    call ([`CALL_HEADER`]) and, when the run ends, reports the numbers whose answer it never
 //!    handed back (`unreceived`, [`Journal::unreceived`]); those entries are unanswered again,
-//!    and stay so if the handler's mark comes later.
+//!    and stay so if the handler's mark comes later. Two cases stay outside this: an answer
+//!    the runner hands back in the same tick the code settles counts as received, though the
+//!    code may never see it; and when there is no runner answer (the host's deadline,
+//!    `runtime_unavailable`) there is no `unreceived` list, so the result stays an error
+//!    listing the calls by the host's own marks.
 //! 3. **Unanswered calls make the result an error with `calls`.** Whenever an entry is
 //!    unanswered, the tool result is an error, whatever the code returned or threw: the run's
 //!    refusal if it was refused, `timeout` if the host's deadline passed or the runner timed
@@ -346,7 +351,7 @@ struct Calls {
     timed_out: bool,
     /// The entry of each answered call, by the runner's number.
     delivered: HashMap<u32, usize>,
-    /// The runner's numbers of calls whose answer never reached the code.
+    /// The runner's numbers of calls whose answer the runner never handed back.
     unreceived: HashSet<u32>,
 }
 
@@ -414,8 +419,8 @@ impl Journal {
         }
     }
 
-    /// Marks the calls the runner numbered `calls` unanswered: their answer never reached the
-    /// code. A number that names no forwarded call (a refused one) changes nothing.
+    /// Marks the calls the runner numbered `calls` unanswered: the runner never handed their
+    /// answer back. A number that names no forwarded call (a refused one) changes nothing.
     pub fn unreceived(&self, calls: &[u32]) {
         let mut state = self.state();
         for &n in calls {

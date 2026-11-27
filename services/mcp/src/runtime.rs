@@ -128,7 +128,7 @@ struct Answer {
     error: Option<AnswerError>,
     #[serde(default)]
     logs: Vec<String>,
-    /// `execute`: the runner's numbers of the calls whose answer never reached the code.
+    /// `execute`: the runner's numbers of the calls whose answer the runner never handed back.
     #[serde(default)]
     unreceived: Vec<u32>,
 }

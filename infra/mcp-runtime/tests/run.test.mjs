@@ -142,6 +142,23 @@ describe("mcp runtime /run", () => {
       assert.equal(second.body.result, 2);
       assert.deepEqual(second.body.unreceived, [1]);
       assert.equal(host.requests.length, 1, "the host received the call");
+
+      // An answer that reached the runner but that the runner hadn't read when the code
+      // settled: the host answers during the busy loop, which keeps the runner from reading.
+      host.requests.length = 0;
+      host.replyDelayMs = 50;
+      const busy = `async () => {
+        chelabase.request({ method: "POST", path: "/v1/x", body: { a: 1 } });
+        await new Promise((r) => setTimeout(r, 20));
+        const end = Date.now() + 400;
+        while (Date.now() < end) {}
+        return 3;
+      }`;
+      const busied = await runCode(rt, job(busy, { kind: "execute", host }));
+      assert.equal(busied.body.ok, true, JSON.stringify(busied.body));
+      assert.equal(busied.body.result, 3);
+      assert.deepEqual(busied.body.unreceived, [1]);
+      assert.equal(host.requests.length, 1, "the host received the call");
       host.replyDelayMs = 0;
 
       // An answer the runner can't read: the code gets a throw, and the call is reported,
