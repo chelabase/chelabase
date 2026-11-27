@@ -974,8 +974,11 @@ impl Builder<'_, '_> {
             inherit: false,
             set: false,
         };
+        // #424: an expiry at or before the floor is one expiry, however it is spelled.
+        let valid_until = crate::plan::ddl::expiry_key(r.valid_until.as_deref()).map(str::to_string);
         let mut canon = Role {
             oid: c.canon_oid(ObjClass::Role, r.oid),
+            valid_until: valid_until.clone(),
             member_of: Vec::new(),
             other_attributes: Vec::new(),
             comment: None,
@@ -1015,7 +1018,7 @@ impl Builder<'_, '_> {
                         r.login,
                         r.inherit,
                         r.connection_limit,
-                        &r.valid_until,
+                        &valid_until,
                         r.bypass_rls
                     )
                 )

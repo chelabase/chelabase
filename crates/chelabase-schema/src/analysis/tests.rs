@@ -2163,3 +2163,39 @@ fn a_role_rename_the_owner_administers_reads_back_without_drift() {
         mrole(&expected, "postgres")
     );
 }
+
+// #424: an expiry at or before the floor (`-infinity`, a BC time, the floor itself) is one
+// expiry, as the plan and the drift check take it: both sides making the role expired, in
+// different spellings, overlap rather than conflict. Any other difference still conflicts.
+#[test]
+fn both_sides_expired_at_or_before_the_floor_overlap() {
+    let spellings = ["0001-01-01 00:00:00+00", "-infinity", "0044-03-15 12:00:00+00 BC"];
+    for t_at in spellings {
+        for s_at in spellings {
+            let b = base();
+            let (mut t, mut s) = (b.clone(), b.clone());
+            t.roles.push(Role { valid_until: Some(t_at.into()), ..role(16500, "gone") });
+            s.roles.push(Role { valid_until: Some(s_at.into()), ..role(16510, "gone") });
+            let a = run(&b, &t, &s);
+            assert!(a.conflicts.is_empty(), "create {t_at} / {s_at}: {:#?}", a.conflicts);
+
+            let mut b = base();
+            b.roles.push(Role { valid_until: Some("2030-01-01 00:00:00+00".into()), ..role(16500, "gone") });
+            let (mut t, mut s) = (b.clone(), b.clone());
+            t.roles.last_mut().unwrap().valid_until = Some(t_at.into());
+            s.roles.last_mut().unwrap().valid_until = Some(s_at.into());
+            let a = run(&b, &t, &s);
+            assert!(a.conflicts.is_empty(), "alter {t_at} / {s_at}: {:#?}", a.conflicts);
+        }
+    }
+    // The floor against the first instant after it, or against no expiry, still conflicts.
+    for other in [Some("0001-01-01 00:00:00.000001+00"), None, Some("infinity")] {
+        let b = base();
+        let (mut t, mut s) = (b.clone(), b.clone());
+        t.roles.push(Role { valid_until: Some("-infinity".into()), ..role(16500, "gone") });
+        s.roles.push(Role { valid_until: other.map(Into::into), ..role(16510, "gone") });
+        let a = run(&b, &t, &s);
+        assert_eq!(a.conflicts.len(), 1, "{other:?}: {:#?}", a.conflicts);
+        assert_eq!(a.conflicts[0].kind, ConflictKind::CreateCollision, "{other:?}");
+    }
+}
