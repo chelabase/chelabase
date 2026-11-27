@@ -1228,6 +1228,9 @@ services:
       CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND: ${CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND:-}
       CHELABASE_GATEWAY_STORAGE_RATE_BURST: ${CHELABASE_GATEWAY_STORAGE_RATE_BURST:-}
       CHELABASE_GATEWAY_STORAGE_RATE_SHARED: ${CHELABASE_GATEWAY_STORAGE_RATE_SHARED:-}
+      # #426: the functions runtime (its service name, resolved on the `functions` network), whose
+      # caller-bound binding calls are limited per original caller. Blank believes nobody.
+      CHELABASE_GATEWAY_FUNCTIONS_RUNTIME: ${CHELABASE_GATEWAY_FUNCTIONS_RUNTIME-functions-runtime}
       CHELABASE_DATA_KEYS_TOKEN_FILE: /run/chelabase/secrets/tokens/data-keys.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
       # mcp-core: the MCP server's public listener (profile `mcp`); blank answers 404 on /mcp.

@@ -1,6 +1,6 @@
 ---
 title: Secrets, env and the data API
-description: A function's secrets and env values, calling the data API through env.CHELABASE as the caller or as a run-as role, and the binding's limits.
+description: A function's secrets and env values, calling the data API through env.CHELABASE or the caller-bound ctx.props.CHELABASE as the caller or as a run-as role, and the binding's limits.
 ---
 
 ## Secrets
@@ -71,6 +71,30 @@ export default {
 
 Row-level security then sees the caller, so an app user gets only their own rows. `chelabase-caller-key` is a **public key only**: a function never receives a caller's secret key, so a call made with a secret key has no key to forward (use the run-as key, or a secret of your own).
 
+### The caller-bound binding
+
+Calls through `env.CHELABASE` all come from the functions runtime, so the gateway's [request limits](/architecture/gateway#request-limits) would put every anonymous caller of a function in one bucket per key: a public function many people call would share 100 data API calls a second between all of them. Each `fetch` invocation also gets **`ctx.props.CHELABASE`**, the same binding bound to the caller who invoked it. Calls through it are limited per **original caller** (the end user's address as the gateway saw it), so each of a function's callers has their own bucket, as if they had called the API directly:
+
+```ts
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext<{ CHELABASE: Fetcher }>) {
+    const res = await ctx.props.CHELABASE.fetch(new URL("/data/v1/query", env.CHELABASE_URL), {
+      method: "POST",
+      headers: { authorization: `Bearer ${request.headers.get("chelabase-caller-key") ?? "none"}` },
+      body: JSON.stringify({ v: 1, op: "select", from: "notes" }),
+    });
+    return new Response(await res.text(), { status: res.status });
+  },
+};
+```
+
+With the TypeScript client, pass it as `fetch` the same way: `fetch: (r, i) => ctx.props.CHELABASE.fetch(r, i)`.
+
+- **Opt-in.** `env.CHELABASE` is unchanged: its calls stay in the runtime address's bucket. Use the caller-bound binding for work done for the caller who invoked the function.
+- **Per invocation.** Keep it to the invocation that received it. A client built from it and kept in module scope sends later callers' calls under the first caller's address.
+- **Who counts as the caller.** On a call to `/functions/v1/…` it is the client address the gateway saw (behind a reverse proxy, list it in `CHELABASE_GATEWAY_TRUSTED_PROXIES`). A function called through another function's caller-bound binding gets the same original caller. Scheduled runs, storage and database events have no caller: their `ctx.props.CHELABASE` has no address and behaves like `env.CHELABASE`.
+- **It only chooses the bucket.** A signed-in app user's token (`chelabase-user`) already has a bucket of its own, wherever the call comes from; secret keys aren't limited. The address is never something a function or a client can set: the runtime drops any `chelabase-original-client-ip` header the function sends, and the gateway believes that header only from the runtime's own address (`CHELABASE_GATEWAY_FUNCTIONS_RUNTIME`).
+
 ### Acting as the function
 
 Set a **run-as role** on the function and it gets a key of its own, `env.CHELABASE_SERVICE_KEY`, that acts as that role. Use it for work that isn't on anyone's behalf: scheduled runs, event handlers and background jobs.
@@ -95,5 +119,5 @@ A custom run-as role can't use the [storage API](/using/storage) yet: the storag
 ### Limits of the binding
 
 - **A function can call itself** through the binding (and so any function, including in a loop) with no hop limit. Guard against recursion in your own code.
-- **All function traffic shares one per-IP bucket at the gateway.** Calls through the binding all come from the runtime's address, so per-IP limits (sign-up, sign-in, key misses) are shared by every function of every tenant on the instance. A caller that vouches for its end user's address does so with the gateway's `chelabase-server-key` and `chelabase-client-ip` headers.
+- **All function traffic shares one per-IP bucket at the gateway.** Calls through the binding all come from the runtime's address, so per-IP limits (sign-up, sign-in, key misses) are shared by every function of every tenant on the instance. Only the data API and storage request limits follow the [caller-bound binding](#the-caller-bound-binding)'s original caller. A caller that vouches for its end user's address does so with the gateway's `chelabase-server-key` and `chelabase-client-ip` headers.
 - **The binding bypasses any reverse proxy** in front of the API host, so filters, allow-lists and rate limits at that proxy do not apply to function traffic.

@@ -85,6 +85,40 @@ describe("the gateway binding", () => {
     }
   });
 
+  // #426: ctx.props.CHELABASE, bound to the invocation's original caller (the address the
+  // functions service sends in x-chelabase-caller-ip), sends that address and only that one.
+  test("the caller-bound binding sends the original caller, never a function's value", async () => {
+    seen.length = 0;
+    const out = await call({ via: "props", forge: "198.51.100.66" }, { "x-chelabase-caller-ip": "203.0.113.9" });
+    assert.equal(out.status, 200, JSON.stringify(out));
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].headers["chelabase-original-client-ip"], "203.0.113.9", "exactly the caller's, once");
+    assert.deepEqual(out.bindings, ["CHELABASE"], "env is unchanged");
+  });
+
+  test("each invocation of one loaded worker gets its own caller", async () => {
+    seen.length = 0;
+    const callers = ["203.0.113.1", "2001:db8::2", "203.0.113.3"];
+    await Promise.all(callers.map((ip) => call({ via: "props", path: `/data/v1/query?c=${ip}` }, { "x-chelabase-caller-ip": ip })));
+    for (const ip of callers) {
+      const s = seen.find((r) => r.url === `/data/v1/query?c=${ip}`);
+      assert.equal(s?.headers["chelabase-original-client-ip"], ip, ip);
+    }
+  });
+
+  test("no original caller from env.CHELABASE, without one, or from a function", async () => {
+    for (const [what, query, headers] of [
+      ["env.CHELABASE", { forge: "198.51.100.66" }, { "x-chelabase-caller-ip": "203.0.113.9" }],
+      ["no caller", { via: "props", forge: "198.51.100.66" }, {}],
+      ["not an address", { via: "props" }, { "x-chelabase-caller-ip": "a b" }],
+    ]) {
+      seen.length = 0;
+      const out = await call(query, headers);
+      assert.equal(out.status, 200, `${what}: ${JSON.stringify(out)}`);
+      assert.equal(seen[0].headers["chelabase-original-client-ip"], undefined, what);
+    }
+  });
+
   test("a direct fetch of the gateway is still refused", async () => {
     const g = store.add(DB, manifest("egress"));
     for (const url of [`http://gateway-functions:${gateway.address().port}/`, `http://${API_HOST}/`]) {

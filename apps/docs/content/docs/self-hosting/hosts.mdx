@@ -101,6 +101,7 @@ An invalid entry stops the gateway at startup with a message naming `CHELABASE_G
 | `CHELABASE_GATEWAY_TRUSTED_PROXIES` | none | Reverse proxies whose forwarded client address the gateway believes: CIDRs or addresses, comma-separated (see [Behind a reverse proxy](#behind-a-reverse-proxy)) |
 | `CHELABASE_GATEWAY_DATA_RATE_PER_SECOND`, `CHELABASE_GATEWAY_DATA_RATE_BURST` | `100`, `300` | Data API requests with a public key, per key and client: the refill rate and the burst (see [Request limits](/architecture/gateway#request-limits)) |
 | `CHELABASE_GATEWAY_STORAGE_RATE_PER_SECOND`, `CHELABASE_GATEWAY_STORAGE_RATE_BURST`, `CHELABASE_GATEWAY_STORAGE_RATE_SHARED` | `100`, `300`, `false` | Storage requests, the same way; `true` draws them from the data API's budget |
+| `CHELABASE_GATEWAY_FUNCTIONS_RUNTIME` | `functions-runtime` | The functions runtime, whose caller-bound binding calls are limited per original caller (see [Request limits](/architecture/gateway#request-limits)); blank believes nobody |
 | `CHELABASE_STUDIO_UPSTREAM` | `http://127.0.0.1:3000` | Where the gateway reaches Studio |
 | `CHELABASE_DOCS_UPSTREAM` | `http://127.0.0.1:3001` | The docs site (used only with a docs host) |
 | `CHELABASE_LANDING_UPSTREAM` | `http://127.0.0.1:3002` | The landing page (used only with a landing host) |

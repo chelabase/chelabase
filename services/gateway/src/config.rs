@@ -1,6 +1,6 @@
 //! Gateway settings from the environment.
 
-use crate::client_addr::TrustedProxies;
+use crate::client_addr::{FunctionsRuntimeSpec, TrustedProxies};
 use crate::registry::Site;
 use crate::request_limits::{Budget, RequestLimitsConfig};
 use crate::upstreams::Upstreams;
@@ -40,6 +40,10 @@ pub struct GatewayConfig {
     /// `CHELABASE_GATEWAY_{DATA,STORAGE}_RATE_{PER_SECOND,BURST}` (defaults 100 and 300) and
     /// `CHELABASE_GATEWAY_STORAGE_RATE_SHARED` (default false).
     pub request_limits: RequestLimitsConfig,
+    /// The functions runtime, whose original-caller address is believed (#426)
+    /// (`CHELABASE_GATEWAY_FUNCTIONS_RUNTIME`, comma-separated CIDRs, addresses or host names,
+    /// default none).
+    pub functions_runtime: FunctionsRuntimeSpec,
 }
 
 /// Everything but the token.
@@ -56,6 +60,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("upstream_timeout", &self.upstream_timeout)
             .field("trusted_proxies", &self.trusted_proxies)
             .field("request_limits", &self.request_limits)
+            .field("functions_runtime", &self.functions_runtime)
             .finish()
     }
 }
@@ -145,6 +150,8 @@ impl GatewayConfig {
                 .map_err(anyhow::Error::msg)?,
             trusted_proxies: parse_trusted_proxies(&or(TRUSTED_PROXIES_ENV, ""))?,
             request_limits: parse_request_limits(&get)?,
+            functions_runtime: FunctionsRuntimeSpec::parse(&or(FUNCTIONS_RUNTIME_ENV, ""))
+                .map_err(|e| anyhow::anyhow!("{FUNCTIONS_RUNTIME_ENV}: {e}"))?,
         })
     }
 }
@@ -217,6 +224,9 @@ fn parse_request_limits(get: &impl Fn(&str) -> Option<String>) -> anyhow::Result
     }
     Ok(RequestLimitsConfig { data, storage, shared })
 }
+
+/// The variable naming the functions runtime's addresses (#426).
+pub const FUNCTIONS_RUNTIME_ENV: &str = "CHELABASE_GATEWAY_FUNCTIONS_RUNTIME";
 
 /// The variable naming the reverse proxies the gateway trusts.
 pub const TRUSTED_PROXIES_ENV: &str = "CHELABASE_GATEWAY_TRUSTED_PROXIES";
@@ -587,5 +597,23 @@ mod tests {
             };
             assert!(msg.contains(var) && msg.contains("CHELABASE_GATEWAY_STORAGE_RATE_SHARED"), "{msg}");
         }
+    }
+
+    // ---- #426: the functions runtime ----
+
+    #[test]
+    fn the_functions_runtime_is_nobody_by_default_and_set_by_its_variable() {
+        for unset in [vec![], vec![(FUNCTIONS_RUNTIME_ENV, " ")]] {
+            assert!(GatewayConfig::from_lookup(with(&unset)).unwrap().functions_runtime.is_empty());
+        }
+        let c = GatewayConfig::from_lookup(with(&[(FUNCTIONS_RUNTIME_ENV, "functions-runtime, 10.214.12.5")])).unwrap();
+        assert_eq!(c.functions_runtime.hosts, vec!["functions-runtime".to_string()]);
+        assert!(c.functions_runtime.addrs.contains("10.214.12.5".parse().unwrap()));
+        assert!(format!("{c:?}").contains("functions_runtime"));
+        let msg = match GatewayConfig::from_lookup(with(&[(FUNCTIONS_RUNTIME_ENV, "10.0.0.1/8")])) {
+            Err(e) => format!("{e:#}"),
+            Ok(_) => panic!("accepted"),
+        };
+        assert!(msg.contains(FUNCTIONS_RUNTIME_ENV), "{msg}");
     }
 }

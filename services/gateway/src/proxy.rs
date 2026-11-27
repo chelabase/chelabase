@@ -1,7 +1,7 @@
 //! Pingora adapter. Only this module and `main.rs` touch Pingora types; the
 //! decisions live in `pipeline`.
 
-use crate::client_addr::{client_address, TrustedProxies};
+use crate::client_addr::{client_address, original_client, FunctionsRuntime, TrustedProxies};
 use crate::pipeline::{
     error_json, GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, CLIENT_IP_HEADER, REQUEST_ID_HEADER,
     SERVER_KEY_HEADER,
@@ -17,6 +17,7 @@ use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -45,6 +46,8 @@ pub struct Gateway {
     forwarded_proto: &'static str,
     /// Peers whose forwarded client address is believed (`CHELABASE_GATEWAY_TRUSTED_PROXIES`).
     trusted_proxies: TrustedProxies,
+    /// The functions runtime's addresses, whose original-caller header is believed (#426).
+    functions_runtime: Arc<FunctionsRuntime>,
 }
 
 impl Gateway {
@@ -58,12 +61,20 @@ impl Gateway {
                 Scheme::Https => "https",
             },
             trusted_proxies: TrustedProxies::default(),
+            functions_runtime: Arc::new(FunctionsRuntime::default()),
         }
     }
 
     /// Believe the forwarded client address from these peers (none by default).
     pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxies) -> Self {
         self.trusted_proxies = trusted_proxies;
+        self
+    }
+
+    /// Believe the original caller's address from the functions runtime at these addresses
+    /// (nobody by default).
+    pub fn with_functions_runtime(mut self, runtime: Arc<FunctionsRuntime>) -> Self {
+        self.functions_runtime = runtime;
         self
     }
 }
@@ -117,6 +128,8 @@ impl ProxyHttp for Gateway {
             .map(|inet| inet.ip());
         let client_ip = client_address(peer, &self.trusted_proxies, &headers);
         ctx.client_ip = client_ip;
+        // #426: decided on the TCP peer itself, never on the address derived above.
+        let original_client_ip = original_client(peer, &self.functions_runtime, &headers);
 
         let handled = self
             .pipeline
@@ -126,6 +139,7 @@ impl ProxyHttp for Gateway {
                 host: host.as_deref(),
                 headers: &headers,
                 client_ip,
+                original_client_ip,
             })
             .await;
 

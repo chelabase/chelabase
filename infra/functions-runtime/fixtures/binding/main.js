@@ -1,9 +1,11 @@
 // Calls the gateway through env.CHELABASE: ?path=… (default /data/v1/schema), with the request's
 // own authorization, an optional ?host=… set as the Host header (which must not stick), and
 // ?spoof=1 adding client-address headers (which must not reach the gateway).
+// ?via=props calls through the caller-bound binding, ctx.props.CHELABASE (#426), instead, and
+// ?forge=… sets the original-caller header itself (which must never reach the gateway).
 // Reports the answer, or the error.
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const q = new URL(request.url).searchParams;
     const headers = { authorization: request.headers.get("authorization") ?? "" };
     if (q.get("host")) headers.host = q.get("host");
@@ -17,9 +19,11 @@ export default {
       headers["true-client-ip"] = "203.0.113.80";
       headers["cf-connecting-ip"] = "203.0.113.81";
     }
+    if (q.get("forge")) headers["chelabase-original-client-ip"] = q.get("forge");
+    const binding = q.get("via") === "props" ? ctx.props?.CHELABASE : env.CHELABASE;
     try {
       const target = q.get("url") ?? `https://anything.invalid${q.get("path") ?? "/data/v1/schema"}`;
-      const res = await env.CHELABASE.fetch(target, { method: q.get("method") ?? "GET", headers });
+      const res = await binding.fetch(target, { method: q.get("method") ?? "GET", headers });
       return Response.json({ status: res.status, body: await res.text(), bindings: Object.keys(env).sort() });
     } catch (e) {
       return Response.json({ error: String(e && e.message), bindings: Object.keys(env).sort() });

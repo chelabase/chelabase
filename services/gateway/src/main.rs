@@ -1,6 +1,7 @@
 //! Chelabase HTTP API gateway: the single front door on plain HTTP.
 
 use chelabase_auth::internal::InternalSigner;
+use gateway::client_addr::FunctionsRuntime;
 use gateway::config::GatewayConfig;
 use gateway::data_keys::DataKeyResolver;
 use gateway::pipeline::Pipeline;
@@ -13,6 +14,9 @@ use pingora_core::server::configuration::ServerConf;
 use pingora_core::server::Server;
 use std::sync::Arc;
 use tracing::info;
+
+/// How often the functions runtime's host names are resolved again (#426).
+const FUNCTIONS_RUNTIME_REFRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 fn main() -> anyhow::Result<()> {
     chelabase_types::cli::handle("gateway", "The Chelabase HTTP API gateway: the single front door.", env!("CARGO_PKG_VERSION"));
@@ -54,6 +58,23 @@ fn main() -> anyhow::Result<()> {
         .with_request_limits(Arc::new(RequestLimits::new(&config.request_limits)));
     info!(limits = ?config.request_limits, "data API and storage requests are limited per key and client");
 
+    // #426: the functions runtime's addresses. A host name (compose's service name) is
+    // resolved now and every few seconds, as the runtime's address changes when it is recreated.
+    let functions_runtime = Arc::new(FunctionsRuntime::new(config.functions_runtime.clone()));
+    if functions_runtime.has_hosts() {
+        functions_runtime.refresh();
+        let runtime = functions_runtime.clone();
+        std::thread::Builder::new()
+            .name("functions-runtime-dns".into())
+            .spawn(move || loop {
+                std::thread::sleep(FUNCTIONS_RUNTIME_REFRESH);
+                runtime.refresh();
+            })?;
+    }
+    if !config.functions_runtime.is_empty() {
+        info!(runtime = ?config.functions_runtime, "the functions runtime's original-caller address is believed");
+    }
+
     // Pingora's defaults assume zero-downtime binary upgrades with long grace
     // periods. Under Compose (the workbench) or k8s a process manager restarts us,
     // so exit promptly on SIGTERM.
@@ -74,7 +95,8 @@ fn main() -> anyhow::Result<()> {
             config.upstream_timeout,
             config.entry.scheme(),
         )
-        .with_trusted_proxies(config.trusted_proxies.clone()),
+        .with_trusted_proxies(config.trusted_proxies.clone())
+        .with_functions_runtime(functions_runtime),
     );
     for addr in &config.listen {
         service.add_tcp(addr);

@@ -36,7 +36,9 @@ use uuid::Uuid;
 use crate::bundles::{self, Bundles, MAX_BUNDLE_BYTES, Put};
 use crate::caller::{self, Caller, Form, Refusal};
 use crate::directory::Resolution;
-use crate::host::{ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation};
+use crate::host::{
+    CALLER_IP_HEADER, ERROR_HEADER, EVENT_HEADER, FunctionHost, HostError, Invocation,
+};
 use crate::limits::{
     Concurrency, Credit, DEFAULT_MAX_CONCURRENT, RestartPolicy, Restarts, Suspect, human,
 };
@@ -54,6 +56,10 @@ pub const AUDIENCE: &str = "functions";
 /// and its user token.
 pub const FORWARDED_KEY: &str = "chelabase-forwarded-key";
 pub const FORWARDED_USER: &str = "chelabase-forwarded-user";
+/// #426: set by the gateway, for this service only, when the call came through a function's
+/// caller-bound binding: that function's original caller's address (`x-forwarded-for` is then
+/// the runtime's).
+pub const ORIGINAL_CLIENT_IP: &str = "chelabase-original-client-ip";
 /// What the function gets.
 pub const CALLER: &str = "chelabase-caller";
 pub const CALLER_KEY: &str = "chelabase-caller-key";
@@ -476,6 +482,12 @@ async fn invoke(
         // copy of the header was stripped).
         headers.insert(DB_EVENT_HEADER, HeaderValue::from_static("db"));
     }
+    if form != Form::Internal
+        && let Some(ip) = caller_address(&req.headers)
+        && let Ok(v) = HeaderValue::from_str(&ip.to_string())
+    {
+        headers.insert(CALLER_IP_HEADER, v);
+    }
     let inv = Invocation {
         method: req.method,
         path_and_query,
@@ -672,6 +684,25 @@ pub(crate) fn strip(headers: &mut HeaderMap, request: bool) {
     for name in drop {
         headers.remove(name);
     }
+}
+
+/// #426: the original caller's address, from the gateway only (it replaces both headers on
+/// every request it forwards): its [`ORIGINAL_CLIENT_IP`] when the call came through a
+/// function's caller-bound binding, else its `x-forwarded-for`. Each must be exactly one line
+/// holding one IP literal; anything else is no address.
+fn caller_address(headers: &HeaderMap) -> Option<std::net::IpAddr> {
+    let literal = |name: &str| -> Option<std::net::IpAddr> {
+        let mut values = headers.get_all(name).iter();
+        let v = values.next()?;
+        if values.next().is_some() {
+            return None;
+        }
+        v.to_str().ok()?.parse().ok()
+    };
+    if headers.contains_key(ORIGINAL_CLIENT_IP) {
+        return literal(ORIGINAL_CLIENT_IP);
+    }
+    literal("x-forwarded-for")
 }
 
 /// The function's request headers: the client's, cleaned, plus who called.
