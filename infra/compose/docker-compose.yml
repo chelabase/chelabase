@@ -1298,7 +1298,7 @@ services:
         condition: service_completed_successfully
 
   rest:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:7410bc3444d83695695530137768e705ff6d50ebcdb82e62c6f15002e39cd794}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/rest:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:da9908538d73ea2ab9958dd6bb951652b66e8a4f1509957dc5e63282d12f3ba7}
     restart: unless-stopped
     # RT1 T1 (S27): its internal bearer (both ways with the orchestrator).
     environment:
