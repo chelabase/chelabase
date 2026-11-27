@@ -1570,7 +1570,7 @@ services:
   # the others: the image's watchdog probes a trivial worker every 2s and after 3 failures ends
   # the container, which `always` restarts. On by default, with the functions service.
   functions-runtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:faa1729a8ac43590f986090878541e0958a50049ccb4563ca48a81d270079e0f}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/functions-runtime:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:9fc3eb945cb2d6976cee8c62652052a40a9d5ced40dcafdbdbbaee90f8dbe729}
     # #183: the functions' `env.CHELABASE` binding reaches the gateway's alias on `functions` at
     # its listening port, always on the API host.
     command: ["/usr/local/bin/workerd", "serve", "--experimental",
