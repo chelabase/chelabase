@@ -1215,7 +1215,7 @@ services:
   # member tokens' issuer only: the gateway serves nothing there.
   # Liveness only in its healthcheck (`/_gateway/ready` waits for its member verify key).
   gateway:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:2ae870ddc13bac6908cd5befe1c289bfec4982957cbd8f87f17d51457fb2f2f2}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/gateway:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:6fc8243c0e31b5f7b1e9270ef35cd150c903bedf25c80a0999fa908fd6273e1f}
     restart: unless-stopped
     # RT1 T1 (S27): the bearers it sends to the orchestrator's internal listener.
     environment:
