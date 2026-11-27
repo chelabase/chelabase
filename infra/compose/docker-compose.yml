@@ -1105,7 +1105,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-d7bac6737e56@sha256:1283bdce2dc006d11aa3334cae9e902380a4b99b34a38296b1c2a08a52779652}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-28c3517fe01e@sha256:b2185db591f37bd57d27830550cb1612a877190ab8a4e56efa01ed60928a0bb1}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
